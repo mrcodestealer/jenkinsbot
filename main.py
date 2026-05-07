@@ -73,6 +73,20 @@ def _reply_text(message_id: str, text: str) -> bool:
     return True
 
 
+def _is_event_delivery(payload: Dict[str, Any]) -> bool:
+    """飞书 Schema 2.0 只有 schema+header+event，没有顶层 type=event_callback。"""
+    if payload.get("type") == "event_callback":
+        return True
+    return payload.get("schema") == "2.0" and isinstance(payload.get("event"), dict)
+
+
+def _event_type(payload: Dict[str, Any]) -> str:
+    if payload.get("schema") == "2.0":
+        return (payload.get("header") or {}).get("event_type", "")
+    evt = payload.get("event") or {}
+    return evt.get("type") or (payload.get("header") or {}).get("event_type", "")
+
+
 def _extract_text_message(event: Dict[str, Any]) -> str:
     content_raw = event.get("message", {}).get("content", "")
     if not content_raw:
@@ -102,11 +116,16 @@ def webhook_event():
     if payload.get("type") == "url_verification":
         return jsonify({"challenge": payload.get("challenge", "")})
 
-    if payload.get("type") != "event_callback":
+    if not _is_event_delivery(payload):
+        logger.info(
+            "ignored webhook: not event delivery keys=%s",
+            list(payload.keys())[:20],
+        )
         return jsonify({"ok": True, "ignored": "not_event_callback"})
 
-    event_type = payload.get("header", {}).get("event_type", "")
+    event_type = _event_type(payload)
     if event_type != "im.message.receive_v1":
+        logger.info("ignored event_type=%s", event_type or "unknown")
         return jsonify({"ok": True, "ignored": event_type or "unknown"})
 
     event = payload.get("event", {})
