@@ -12,7 +12,9 @@ logger = logging.getLogger("jenkinsbot")
 
 app = Flask(__name__)
 
-LARK_HOST = os.getenv("LARK_HOST", "https://open.larksuite.com").rstrip("/")
+# 国内飞书用 https://open.feishu.cn；国际 Lark 用 https://open.larksuite.com
+# Feishu (China): https://open.feishu.cn | Lark (intl): https://open.larksuite.com
+LARK_HOST = os.getenv("LARK_HOST", "https://open.feishu.cn").rstrip("/")
 VERIFICATION_TOKEN = os.getenv(
     "VERIFICATION_TOKEN", "DwMDDJluT9vFnQUxGxvxBcRbhODKPlah"
 )
@@ -117,8 +119,21 @@ def webhook_event():
         return jsonify({"ok": True, "ignored": "non_text_or_missing_message_id"})
 
     text = _extract_text_message(event)
+    logger.info(
+        "im.message.receive_v1 message_id=%s chat_type=%s text=%r",
+        message_id,
+        event.get("message", {}).get("chat_type"),
+        text[:300] if text else text,
+    )
+
     if "hi" in text.lower():
         success = _reply_text(message_id, "hi")
+        if success:
+            logger.info("replied hi to message_id=%s", message_id)
+        else:
+            logger.error(
+                "reply failed (check LARK_HOST feishu.cn vs larksuite.com, scopes, logs above)"
+            )
         return jsonify({"ok": success})
 
     return jsonify({"ok": True, "ignored": "text_not_hi"})
