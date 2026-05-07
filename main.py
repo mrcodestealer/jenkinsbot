@@ -206,17 +206,48 @@ def _parse_job_base_and_build(url: str) -> Tuple[str, Optional[int]]:
     return raw.rstrip("/") + "/", None
 
 
-def _fetch_last_build_number(job_base: str, auth: Tuple[str, str]) -> Optional[int]:
-    nurl = f"{job_base.rstrip('/')}/lastBuild/buildNumber"
-    try:
-        r = requests.get(nurl, auth=auth, timeout=30)
-        if r.status_code != 200:
-            logger.warning("lastBuild/buildNumber HTTP %s", r.status_code)
-            return None
-        return int(r.text.strip())
-    except Exception as exc:
-        logger.exception("lastBuild/buildNumber failed: %s", exc)
+def _explicit_build_after_url(full_text: str, url: str) -> Optional[int]:
+    """
+    支持：URL 后面单独写构建号，例如
+    @bot https://jenkins/.../job/Foo/ 680
+    """
+    if not full_text or not url:
         return None
+    candidates = [url]
+    if url.endswith("/"):
+        candidates.append(url.rstrip("/"))
+    else:
+        candidates.append(url + "/")
+
+    pos = -1
+    matched_len = 0
+    for c in candidates:
+        p = full_text.find(c)
+        if p >= 0:
+            pos = p
+            matched_len = len(c)
+            break
+    if pos < 0:
+        return None
+
+    tail = full_text[pos + matched_len :].strip()
+    m = re.match(r"^(\d{1,8})\b", tail)
+    return int(m.group(1)) if m else None
+
+
+def _jenkins_build_exists(
+    job_base: str, build: int, auth: Tuple[str, str]
+) -> bool:
+    """确认历史构建号存在（对应 Build History 里那一次）。"""
+    url = f"{job_base.rstrip('/')}/{build}/api/json"
+    try:
+        r = requests.get(url, auth=auth, timeout=20)
+        if r.status_code != 200:
+            logger.warning("build api/json HTTP %s for #%s", r.status_code, build)
+        return r.status_code == 200
+    except Exception as exc:
+        logger.warning("build exists check failed: %s", exc)
+        return False
 
 
 def _fetch_console_text(console_url: str, auth: Tuple[str, str]) -> Optional[str]:
@@ -283,13 +314,29 @@ def _jenkins_watch_worker(
         time.sleep(POLL_SECONDS)
 
 
-def _start_jenkins_watch_from_url(url: str, reply_message_id: Optional[str]) -> bool:
+def _start_jenkins_watch_from_url(
+    url: str, reply_message_id: Optional[str], message_text: str = ""
+) -> Tuple[str, Optional[int]]:
+    """
+    仅监控你指定的构建号（URL 末尾 /680/ 或链接后单独写 680）。
+    不再使用 lastBuild。
+    返回: ("ok", build) | ("no_build_number", None) | ("build_not_found", build)
+    """
     job_base, build = _parse_job_base_and_build(url)
     if build is None:
-        build = _fetch_last_build_number(job_base, (JENKINS_USER, JENKINS_PASSWORD))
-        if build is None:
-            logger.error("cannot resolve build number for %s", job_base)
-            return False
+        explicit = _explicit_build_after_url(message_text, url)
+        if explicit is not None:
+            build = explicit
+            logger.info("jenkins using explicit build from message: %s", build)
+
+    if build is None:
+        logger.error("no build number provided for job %s", job_base)
+        return "no_build_number", None
+
+    auth = (JENKINS_USER, JENKINS_PASSWORD)
+    if not _jenkins_build_exists(job_base, build, auth):
+        logger.error("jenkins build #%s not found under %s", build, job_base)
+        return "build_not_found", build
 
     t = threading.Thread(
         target=_jenkins_watch_worker,
@@ -298,7 +345,7 @@ def _start_jenkins_watch_from_url(url: str, reply_message_id: Optional[str]) -> 
         name=f"jenkins-watch-{build}",
     )
     t.start()
-    return True
+    return "ok", build
 
 
 def _is_event_delivery(payload: Dict[str, Any]) -> bool:
@@ -381,16 +428,26 @@ def webhook_event():
     jenkins_urls = [u for u in _extract_urls(text) if _is_jenkins_job_url(u)]
     if jenkins_urls:
         url = jenkins_urls[0]
-        started = _start_jenkins_watch_from_url(url, message_id)
-        if started:
+        status, build_no = _start_jenkins_watch_from_url(url, message_id, text)
+        if status == "ok":
             _reply_text(
                 message_id,
-                "已开始后台监控该 Jenkins 任务的 console（每 "
+                f"已开始后台监控 Jenkins #{build_no} 的 console（每 "
                 f"{POLL_SECONDS}s 拉取）。结束或长时间无变化时会发到目标群并 @ 指定同事。",
             )
-            return jsonify({"ok": True, "jenkins_watch": "started"})
-        _reply_text(message_id, "无法解析 Jenkins 构建号（lastBuild）。请检查链接与账号权限。")
-        return jsonify({"ok": False, "jenkins_watch": "failed"})
+            return jsonify({"ok": True, "jenkins_watch": "started", "build": build_no})
+        if status == "no_build_number":
+            _reply_text(
+                message_id,
+                "请指定历史构建号：链接末尾带 /680/，或在链接后空格写 680。"
+                "不再自动使用最新一次构建（last build）。",
+            )
+            return jsonify({"ok": False, "jenkins_watch": "no_build_number"})
+        _reply_text(
+            message_id,
+            f"构建 #{build_no} 在该 Job 下不存在或无权限查看，请核对 Build History 里的号码。",
+        )
+        return jsonify({"ok": False, "jenkins_watch": "build_not_found"})
 
     return jsonify({"ok": True, "ignored": "no_command"})
 
