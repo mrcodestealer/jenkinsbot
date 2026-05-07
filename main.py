@@ -132,7 +132,8 @@ def _send_done_card(result: str, console_tail: str) -> None:
     elif result == "ABORTED":
         template = "grey"
 
-    at = f'<at user_id="{NOTIFY_USER_OPEN_ID}"></at>'
+    # 飞书卡片 lark_md：使用 <at id=ou_xxx></at>（与 user_id 写法不同）
+    at = f"<at id={NOTIFY_USER_OPEN_ID}></at>"
     tail = console_tail[-800:] if console_tail else ""
     card = {
         "config": {"wide_screen_mode": True},
@@ -158,7 +159,7 @@ def _send_done_card(result: str, console_tail: str) -> None:
 
 
 def _send_stuck_card(last_snippet: str) -> None:
-    at = f'<at user_id="{NOTIFY_USER_OPEN_ID}"></at>'
+    at = f"<at id={NOTIFY_USER_OPEN_ID}></at>"
     snippet = (last_snippet or "").strip()[-1200:]
     card = {
         "config": {"wide_screen_mode": True},
@@ -263,11 +264,7 @@ def _fetch_console_text(console_url: str, auth: Tuple[str, str]) -> Optional[str
         return None
 
 
-def _jenkins_watch_worker(
-    job_base: str,
-    build: int,
-    reply_message_id: Optional[str],
-) -> None:
+def _jenkins_watch_worker(job_base: str, build: int) -> None:
     auth = (JENKINS_USER, JENKINS_PASSWORD)
     console_url = f"{job_base.rstrip('/')}/{build}/consoleText"
     logger.info("jenkins watch start job_base=%s build=%s", job_base, build)
@@ -293,11 +290,6 @@ def _jenkins_watch_worker(
             result = fin.group(1)
             logger.info("jenkins finished %s build=%s", result, build)
             _send_done_card(result, text or "")
-            if reply_message_id:
-                _reply_text(
-                    reply_message_id,
-                    f"Jenkins #{build} 已结束：{result}，已在群里发卡片。",
-                )
             return
 
         if (not stuck_sent) and (now - unchanged_since) >= STUCK_SECONDS:
@@ -305,17 +297,12 @@ def _jenkins_watch_worker(
             tail = (text or "")[-1500:]
             logger.warning("jenkins stuck build=%s", build)
             _send_stuck_card(tail)
-            if reply_message_id:
-                _reply_text(
-                    reply_message_id,
-                    f"Jenkins #{build} 日志 {STUCK_SECONDS}s 未变化，已在群里 @ 提醒可能卡住。",
-                )
 
         time.sleep(POLL_SECONDS)
 
 
 def _start_jenkins_watch_from_url(
-    url: str, reply_message_id: Optional[str], message_text: str = ""
+    url: str, message_text: str = ""
 ) -> Tuple[str, Optional[int]]:
     """
     仅监控你指定的构建号（URL 末尾 /680/ 或链接后单独写 680）。
@@ -340,7 +327,7 @@ def _start_jenkins_watch_from_url(
 
     t = threading.Thread(
         target=_jenkins_watch_worker,
-        args=(job_base, build, reply_message_id),
+        args=(job_base, build),
         daemon=True,
         name=f"jenkins-watch-{build}",
     )
@@ -428,7 +415,7 @@ def webhook_event():
     jenkins_urls = [u for u in _extract_urls(text) if _is_jenkins_job_url(u)]
     if jenkins_urls:
         url = jenkins_urls[0]
-        status, build_no = _start_jenkins_watch_from_url(url, message_id, text)
+        status, build_no = _start_jenkins_watch_from_url(url, text)
         if status == "ok":
             _reply_text(
                 message_id,
