@@ -13,8 +13,11 @@ logger = logging.getLogger("jenkinsbot")
 app = Flask(__name__)
 
 LARK_HOST = os.getenv("LARK_HOST", "https://open.larksuite.com").rstrip("/")
-APP_ID = os.getenv("APP_ID", "")
-APP_SECRET = os.getenv("APP_SECRET", "")
+VERIFICATION_TOKEN = os.getenv(
+    "VERIFICATION_TOKEN", "DwMDDJluT9vFnQUxGxvxBcRbhODKPlah"
+)
+APP_ID = os.getenv("APP_ID", "cli_a97610f57db85ed2")
+APP_SECRET = os.getenv("APP_SECRET", "wkC8KYe3nR5YLkn3xJW3lglyoEVMzAMF")
 PORT = int(os.getenv("PORT", "5008"))
 
 
@@ -87,6 +90,11 @@ def healthz():
 @app.post("/webhook/event")
 def webhook_event():
     payload = request.get_json(silent=True) or {}
+    incoming_token = payload.get("token") or payload.get("header", {}).get("token")
+
+    if incoming_token and incoming_token != VERIFICATION_TOKEN:
+        logger.warning("Invalid verification token.")
+        return jsonify({"ok": False, "error": "invalid_verification_token"}), 403
 
     # URL verification when configuring webhook in Lark/Feishu.
     if payload.get("type") == "url_verification":
