@@ -404,14 +404,6 @@ def webhook_event():
         text[:300] if text else text,
     )
 
-    if "hi" in text.lower():
-        success = _reply_text(message_id, "hi")
-        if success:
-            logger.info("replied hi to message_id=%s", message_id)
-        else:
-            logger.error("reply hi failed")
-        return jsonify({"ok": success})
-
     jenkins_urls = [u for u in _extract_urls(text) if _is_jenkins_job_url(u)]
     if jenkins_urls:
         url = jenkins_urls[0]
