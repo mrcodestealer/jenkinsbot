@@ -36,7 +36,13 @@ NOTIFY_USER_OPEN_ID = os.getenv(
     "NOTIFY_USER_OPEN_ID", "ou_d7bc33724e2d6ced4050c944c2ca5650"
 )
 
-POLL_SECONDS = int(os.getenv("JENKINS_POLL_SECONDS", "10"))
+# 轮询 consoleText 间隔：默认 1s，减少「Finished」后出现延迟；可调 env（支持小数，如 0.5）
+_POLL_RAW = os.getenv("JENKINS_POLL_SECONDS", "1")
+try:
+    POLL_SECONDS = max(0.3, float(_POLL_RAW))
+except ValueError:
+    POLL_SECONDS = 1.0
+
 STUCK_SECONDS = int(os.getenv("JENKINS_STUCK_SECONDS", "300"))
 
 _FINISHED_RE = re.compile(
@@ -409,10 +415,15 @@ def webhook_event():
         url = jenkins_urls[0]
         status, build_no = _start_jenkins_watch_from_url(url, text)
         if status == "ok":
+            _poll_hint = (
+                str(int(POLL_SECONDS))
+                if float(POLL_SECONDS).is_integer()
+                else str(POLL_SECONDS)
+            )
             _reply_text(
                 message_id,
-                f"已开始后台监控 Jenkins #{build_no} 的 console（每 "
-                f"{POLL_SECONDS}s 拉取）。结束或长时间无变化时会发到目标群并 @ 指定同事。",
+                f"已开始后台监控 Jenkins #{build_no} 的 console（约每 {_poll_hint}s "
+                "拉取完整日志，尽快检测 Finished）。结束或长时间无变化时会发到目标群。",
             )
             return jsonify({"ok": True, "jenkins_watch": "started", "build": build_no})
         if status == "no_build_number":
