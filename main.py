@@ -4,46 +4,49 @@ import os
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jenkinsbot")
 
 app = Flask(__name__)
 
-# 国内飞书 | Lark intl
-LARK_HOST = os.getenv("LARK_HOST", "https://open.feishu.cn").rstrip("/")
-VERIFICATION_TOKEN = os.getenv(
-    "VERIFICATION_TOKEN", "DwMDDJluT9vFnQUxGxvxBcRbhODKPlah"
-)
-APP_ID = os.getenv("APP_ID", "cli_a97610f57db85ed2")
-APP_SECRET = os.getenv("APP_SECRET", "wkC8KYe3nR5YLkn3xJW3lglyoEVMzAMF")
-PORT = int(os.getenv("PORT", "5008"))
 
-# Jenkins Basic Auth（建议用环境变量覆盖）
-JENKINS_USER = os.getenv("JENKINS_USER", "junchen")
-JENKINS_PASSWORD = os.getenv("JENKINS_PASSWORD", "junchen")
+def _env(name: str) -> str:
+    value = (os.getenv(name) or "").strip()
+    if not value:
+        raise RuntimeError(f"Missing {name} in .env")
+    return value
 
-# 完成后 / 卡住时通知的群与用户（open_id）
-NOTIFY_CHAT_ID = os.getenv(
-    "NOTIFY_CHAT_ID", "oc_9de3d63fc589df6feeb9b0bee9c45b72"
-)
-NOTIFY_USER_OPEN_ID = os.getenv(
-    "NOTIFY_USER_OPEN_ID", "ou_d7bc33724e2d6ced4050c944c2ca5650"
-)
 
-# 轮询 consoleText 间隔：默认 1s，减少「Finished」后出现延迟；可调 env（支持小数，如 0.5）
-_POLL_RAW = os.getenv("JENKINS_POLL_SECONDS", "1")
+# 国内飞书 | Lark intl — 全部从 .env 读取
+LARK_HOST = _env("LARK_HOST").rstrip("/")
+VERIFICATION_TOKEN = _env("VERIFICATION_TOKEN")
+APP_ID = _env("APP_ID")
+APP_SECRET = _env("APP_SECRET")
+PORT = int(_env("PORT"))
+
+JENKINS_USER = _env("JENKINS_USER")
+JENKINS_PASSWORD = _env("JENKINS_PASSWORD")
+
+NOTIFY_CHAT_ID = _env("NOTIFY_CHAT_ID")
+NOTIFY_USER_OPEN_ID = _env("NOTIFY_USER_OPEN_ID")
+
+_POLL_RAW = _env("JENKINS_POLL_SECONDS")
 try:
     POLL_SECONDS = max(0.3, float(_POLL_RAW))
 except ValueError:
     POLL_SECONDS = 1.0
 
-STUCK_SECONDS = int(os.getenv("JENKINS_STUCK_SECONDS", "300"))
+STUCK_SECONDS = int(_env("JENKINS_STUCK_SECONDS"))
 
 _FINISHED_RE = re.compile(
     r"Finished:\s*(SUCCESS|FAILURE|ABORTED)\s*$", re.MULTILINE
