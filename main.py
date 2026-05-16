@@ -9,13 +9,33 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
-from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+
+def _load_dotenv(env_path: Path) -> None:
+    """Load KEY=VALUE lines from .env (no python-dotenv dependency)."""
+    if not env_path.is_file():
+        return
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jenkinsbot")
+
+_env_file = Path(__file__).resolve().parent / ".env"
+if not _env_file.is_file():
+    logger.warning(".env not found at %s", _env_file)
+_load_dotenv(_env_file)
 
 app = Flask(__name__)
 
