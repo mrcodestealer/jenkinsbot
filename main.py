@@ -131,7 +131,15 @@ def _send_chat_message(
     return True
 
 
-def _send_done_card(result: str, console_tail: str) -> None:
+def _send_done_card(
+    result: str,
+    console_tail: str,
+    *,
+    pipeline: str,
+    environment: str,
+    build: int,
+    build_url: str,
+) -> None:
     template = "green"
     if result == "FAILURE":
         template = "red"
@@ -145,7 +153,12 @@ def _send_done_card(result: str, console_tail: str) -> None:
         "config": {"wide_screen_mode": True},
         "header": {
             "template": template,
-            "title": {"tag": "plain_text", "content": f"Jenkins Finished: {result}"},
+            "title": {
+                "tag": "plain_text",
+                "content": (
+                    f"Jenkins Finished: {result} | {environment} / {pipeline}"
+                ),
+            },
         },
         "elements": [
             {
@@ -154,14 +167,26 @@ def _send_done_card(result: str, console_tail: str) -> None:
                     "tag": "lark_md",
                     "content": (
                         f"{at}\n**done update kindly check**\n\n"
-                        f"状态：**{result}**\n\n```\n{tail}\n```"
+                        f"- **Environment：** {environment}\n"
+                        f"- **Pipeline：** {pipeline}\n"
+                        f"- **Build：** #{build}\n"
+                        f"- **状态：** {result}\n"
+                        f"- **链接：** {build_url}\n\n"
+                        f"```\n{tail}\n```"
                     ),
                 },
             }
         ],
     }
     ok = _send_chat_message(NOTIFY_CHAT_ID, "interactive", card)
-    logger.info("send_done_card interactive ok=%s result=%s", ok, result)
+    logger.info(
+        "send_done_card interactive ok=%s result=%s env=%s pipeline=%s build=%s",
+        ok,
+        result,
+        environment,
+        pipeline,
+        build,
+    )
 
 
 def _send_stuck_card(last_snippet: str) -> None:
@@ -211,6 +236,96 @@ def _parse_job_base_and_build(url: str) -> Tuple[str, Optional[int]]:
         base = raw[: m.start()].rstrip("/") + "/"
         return base, build
     return raw.rstrip("/") + "/", None
+
+
+def _job_path_segments(job_base: str) -> List[str]:
+    """从 job URL 解析 /job/A/job/B/... 中的各段名称。"""
+    try:
+        path = urlparse(job_base).path or ""
+    except Exception:
+        return []
+    return re.findall(r"/job/([^/]+)", path, re.IGNORECASE)
+
+
+_ENV_SEGMENT_RE = re.compile(
+    r"^(uat|prod|dev|staging|test|sit|preprod|pre-prod|qa)(?:[-_]?\d+)?$",
+    re.IGNORECASE,
+)
+_CONSOLE_ENV_RE = re.compile(
+    r"(?:^|\n)\s*Environment\s*[:=]\s*['\"]?([^\s'\"`,]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _pipeline_and_env_from_segments(segments: List[str]) -> Tuple[str, Optional[str]]:
+    """pipeline=末级 job 名；environment=路径中像 UAT/uat-2 的文件夹段（若有）。"""
+    if not segments:
+        return "unknown", None
+    pipeline = segments[-1]
+    env: Optional[str] = None
+    for seg in reversed(segments[:-1]):
+        if _ENV_SEGMENT_RE.match(seg) or re.search(r"uat[-_]?\d+", seg, re.I):
+            env = seg
+            break
+    if env is None and len(segments) >= 2:
+        env = segments[-2]
+    return pipeline, env
+
+
+def _extract_environment_from_console(text: str) -> Optional[str]:
+    m = _CONSOLE_ENV_RE.search(text or "")
+    return m.group(1).strip() if m else None
+
+
+def _fetch_build_environment(
+    job_base: str, build: int, auth: Tuple[str, str]
+) -> Optional[str]:
+    """从构建 api/json 的 ParametersAction 读取 Environment 参数。"""
+    url = f"{job_base.rstrip('/')}/{build}/api/json"
+    try:
+        r = requests.get(url, auth=auth, timeout=20)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+    except Exception as exc:
+        logger.warning("build params api failed: %s", exc)
+        return None
+
+    for action in data.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        params = action.get("parameters")
+        if not isinstance(params, list):
+            continue
+        for p in params:
+            if not isinstance(p, dict):
+                continue
+            name = (p.get("name") or "").strip()
+            if name.lower() == "environment":
+                val = p.get("value")
+                if val is not None and str(val).strip():
+                    return str(val).strip()
+    return None
+
+
+def _resolve_job_context(
+    job_base: str, build: int, console_text: str, auth: Tuple[str, str]
+) -> Dict[str, str]:
+    segments = _job_path_segments(job_base)
+    pipeline, path_env = _pipeline_and_env_from_segments(segments)
+    env = (
+        _fetch_build_environment(job_base, build, auth)
+        or _extract_environment_from_console(console_text)
+        or path_env
+        or "—"
+    )
+    build_url = f"{job_base.rstrip('/')}/{build}/"
+    return {
+        "pipeline": pipeline,
+        "environment": env,
+        "build": str(build),
+        "build_url": build_url,
+    }
 
 
 def _explicit_build_after_url(full_text: str, url: str) -> Optional[int]:
@@ -294,8 +409,22 @@ def _jenkins_watch_worker(job_base: str, build: int) -> None:
         fin = _FINISHED_RE.search(text or "")
         if fin:
             result = fin.group(1)
-            logger.info("jenkins finished %s build=%s", result, build)
-            _send_done_card(result, text or "")
+            ctx = _resolve_job_context(job_base, build, text or "", auth)
+            logger.info(
+                "jenkins finished %s build=%s env=%s pipeline=%s",
+                result,
+                build,
+                ctx["environment"],
+                ctx["pipeline"],
+            )
+            _send_done_card(
+                result,
+                text or "",
+                pipeline=ctx["pipeline"],
+                environment=ctx["environment"],
+                build=build,
+                build_url=ctx["build_url"],
+            )
             return
 
         if (not stuck_sent) and (now - unchanged_since) >= STUCK_SECONDS:
@@ -309,13 +438,16 @@ def _jenkins_watch_worker(job_base: str, build: int) -> None:
 
 def _start_jenkins_watch_from_url(
     url: str, message_text: str = ""
-) -> Tuple[str, Optional[int]]:
+) -> Tuple[str, Optional[int], str, Optional[str]]:
     """
     仅监控你指定的构建号（URL 末尾 /680/ 或链接后单独写 680）。
     不再使用 lastBuild。
-    返回: ("ok", build) | ("no_build_number", None) | ("build_not_found", build)
+    返回: (status, build, pipeline, path_env_hint)
     """
     job_base, build = _parse_job_base_and_build(url)
+    segments = _job_path_segments(job_base)
+    pipeline, path_env = _pipeline_and_env_from_segments(segments)
+
     if build is None:
         explicit = _explicit_build_after_url(message_text, url)
         if explicit is not None:
@@ -324,12 +456,12 @@ def _start_jenkins_watch_from_url(
 
     if build is None:
         logger.error("no build number provided for job %s", job_base)
-        return "no_build_number", None
+        return "no_build_number", None, pipeline, path_env
 
     auth = (JENKINS_USER, JENKINS_PASSWORD)
     if not _jenkins_build_exists(job_base, build, auth):
         logger.error("jenkins build #%s not found under %s", build, job_base)
-        return "build_not_found", build
+        return "build_not_found", build, pipeline, path_env
 
     t = threading.Thread(
         target=_jenkins_watch_worker,
@@ -338,7 +470,7 @@ def _start_jenkins_watch_from_url(
         name=f"jenkins-watch-{build}",
     )
     t.start()
-    return "ok", build
+    return "ok", build, pipeline, path_env
 
 
 def _is_event_delivery(payload: Dict[str, Any]) -> bool:
@@ -413,19 +545,29 @@ def webhook_event():
     jenkins_urls = [u for u in _extract_urls(text) if _is_jenkins_job_url(u)]
     if jenkins_urls:
         url = jenkins_urls[0]
-        status, build_no = _start_jenkins_watch_from_url(url, text)
+        status, build_no, pipeline, path_env = _start_jenkins_watch_from_url(url, text)
         if status == "ok":
             _poll_hint = (
                 str(int(POLL_SECONDS))
                 if float(POLL_SECONDS).is_integer()
                 else str(POLL_SECONDS)
             )
+            env_hint = f"，Environment（路径推测）：{path_env}" if path_env else ""
             _reply_text(
                 message_id,
-                f"已开始后台监控 Jenkins #{build_no} 的 console（约每 {_poll_hint}s "
-                "拉取完整日志，尽快检测 Finished）。结束或长时间无变化时会发到目标群。",
+                f"已开始后台监控 Jenkins #{build_no}（Pipeline：{pipeline}{env_hint}）的 "
+                f"console（约每 {_poll_hint}s 拉取完整日志，尽快检测 Finished）。"
+                "结束后会在目标群通知 Environment / Pipeline / 状态。",
             )
-            return jsonify({"ok": True, "jenkins_watch": "started", "build": build_no})
+            return jsonify(
+                {
+                    "ok": True,
+                    "jenkins_watch": "started",
+                    "build": build_no,
+                    "pipeline": pipeline,
+                    "path_env": path_env,
+                }
+            )
         if status == "no_build_number":
             _reply_text(
                 message_id,
