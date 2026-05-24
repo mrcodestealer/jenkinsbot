@@ -4,6 +4,7 @@ import os
 import re
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -59,6 +60,7 @@ JENKINS_PASSWORD = _env("JENKINS_PASSWORD")
 
 NOTIFY_CHAT_ID = _env("NOTIFY_CHAT_ID")
 NOTIFY_USER_OPEN_ID = _env("NOTIFY_USER_OPEN_ID")
+DUTY_BOT_OPEN_ID = (os.getenv("DUTY_BOT_OPEN_ID") or "ou_1f6596a9923a2a835918e7e2513595d5").strip()
 
 _POLL_RAW = _env("JENKINS_POLL_SECONDS")
 try:
@@ -72,6 +74,11 @@ _FINISHED_RE = re.compile(
     r"Finished:\s*(SUCCESS|FAILURE|ABORTED)\s*$", re.MULTILINE
 )
 _URL_RE = re.compile(r"https?://[^\s<>'\"{}|\\^`\[\]]+", re.IGNORECASE)
+_SUCCESS_INFORM_TIME_RE = re.compile(r"/SuccessInformMeTime\b", re.I)
+_SUCCESS_INFORM_RE = re.compile(r"/SuccessInformMe\b", re.I)
+
+_watch_meta_lock = threading.Lock()
+_watch_meta: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
 
 def _get_tenant_access_token() -> Optional[str]:
@@ -408,7 +415,71 @@ def _fetch_console_text(console_url: str, auth: Tuple[str, str]) -> Optional[str
         return None
 
 
-def _jenkins_watch_worker(job_base: str, build: int) -> None:
+def _format_local_time_pm() -> str:
+    try:
+        from zoneinfo import ZoneInfo
+
+        now = datetime.now(ZoneInfo("Asia/Singapore"))
+    except Exception:
+        now = datetime.now()
+    hour = now.hour % 12 or 12
+    ampm = "AM" if now.hour < 12 else "PM"
+    return f"{hour}:{now.minute:02d}{ampm}"
+
+
+def _send_duty_text(text: str) -> bool:
+    duty = (DUTY_BOT_OPEN_ID or "").strip()
+    if not duty:
+        logger.warning("DUTY_BOT_OPEN_ID missing — skip duty notify")
+        return False
+    at = f"<at id={duty}></at>"
+    return _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": f"{at} {text}".strip()})
+
+
+def _parse_success_inform_command(text: str) -> Optional[Dict[str, Any]]:
+    if not (_SUCCESS_INFORM_RE.search(text or "") or _SUCCESS_INFORM_TIME_RE.search(text or "")):
+        return None
+    time_mode = bool(_SUCCESS_INFORM_TIME_RE.search(text or ""))
+    urls = [u for u in _extract_urls(text) if _is_jenkins_job_url(u)]
+    if not urls:
+        return None
+    url = urls[0]
+    job_base, build = _parse_job_base_and_build(url)
+    if build is None:
+        build = _explicit_build_after_url(text, url)
+    if build is None:
+        return None
+    email_title = ""
+    if "|" in text:
+        email_title = text.split("|", 1)[1].strip()
+    return {
+        "mode": "inform_time" if time_mode else "inform",
+        "job_base": job_base,
+        "build": build,
+        "email_title": email_title,
+    }
+
+
+def _notify_duty_after_inform_watch(
+    result: str,
+    meta: Dict[str, Any],
+    ctx: Dict[str, str],
+) -> None:
+    if result != "SUCCESS":
+        _send_duty_text("/FailedStop")
+        return
+    if meta.get("mode") == "inform_time":
+        title = (meta.get("email_title") or "").strip()
+        pipeline = (ctx.get("pipeline") or "").strip()
+        when = _format_local_time_pm()
+        _send_duty_text(f"{title} {pipeline} {when}".strip())
+    elif meta.get("mode") == "inform":
+        _send_duty_text("/SuccessProceedNext")
+
+
+def _jenkins_watch_worker(
+    job_base: str, build: int, meta: Optional[Dict[str, Any]] = None
+) -> None:
     auth = (JENKINS_USER, JENKINS_PASSWORD)
     console_url = f"{job_base.rstrip('/')}/{build}/consoleText"
     logger.info("jenkins watch start job_base=%s build=%s", job_base, build)
@@ -448,6 +519,10 @@ def _jenkins_watch_worker(job_base: str, build: int) -> None:
                 build=build,
                 build_url=ctx["build_url"],
             )
+            if isinstance(meta, dict) and meta.get("mode") in ("inform", "inform_time"):
+                _notify_duty_after_inform_watch(result, meta, ctx)
+            with _watch_meta_lock:
+                _watch_meta.pop((job_base, build), None)
             return
 
         if (not stuck_sent) and (now - unchanged_since) >= STUCK_SECONDS:
@@ -460,7 +535,10 @@ def _jenkins_watch_worker(job_base: str, build: int) -> None:
 
 
 def _start_jenkins_watch_from_url(
-    url: str, message_text: str = ""
+    url: str,
+    message_text: str = "",
+    *,
+    meta: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Optional[int], str, Optional[str]]:
     """
     仅监控你指定的构建号（URL 末尾 /680/ 或链接后单独写 680）。
@@ -489,10 +567,14 @@ def _start_jenkins_watch_from_url(
     t = threading.Thread(
         target=_jenkins_watch_worker,
         args=(job_base, build),
+        kwargs={"meta": meta},
         daemon=True,
         name=f"jenkins-watch-{build}",
     )
     t.start()
+    if isinstance(meta, dict) and meta.get("mode"):
+        with _watch_meta_lock:
+            _watch_meta[(job_base, build)] = dict(meta)
     return "ok", build, pipeline, path_env
 
 
@@ -564,6 +646,39 @@ def webhook_event():
         event.get("message", {}).get("chat_type"),
         text[:300] if text else text,
     )
+
+    inform = _parse_success_inform_command(text)
+    if inform:
+        url = f"{inform['job_base'].rstrip('/')}/{inform['build']}/"
+        status, build_no, pipeline, path_env = _start_jenkins_watch_from_url(
+            url,
+            text,
+            meta=inform,
+        )
+        if status == "ok":
+            mode = inform.get("mode") or "inform"
+            _reply_text(
+                message_id,
+                f"已开始监控 Jenkins #{build_no}（{mode}）— Pipeline：{pipeline}。"
+                "完成后会通知 duty bot。",
+            )
+            return jsonify(
+                {
+                    "ok": True,
+                    "jenkins_watch": "started",
+                    "build": build_no,
+                    "pipeline": pipeline,
+                    "mode": mode,
+                }
+            )
+        if status == "no_build_number":
+            _reply_text(message_id, "请指定构建号（链接末尾 /680/ 或链接后空格写 680）。")
+            return jsonify({"ok": False, "jenkins_watch": "no_build_number"})
+        _reply_text(
+            message_id,
+            f"构建 #{build_no} 不存在或无权限，请核对 Build History。",
+        )
+        return jsonify({"ok": False, "jenkins_watch": "build_not_found"})
 
     jenkins_urls = [u for u in _extract_urls(text) if _is_jenkins_job_url(u)]
     if jenkins_urls:
