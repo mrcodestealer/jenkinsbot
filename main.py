@@ -460,6 +460,48 @@ def _parse_success_inform_command(text: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _notify_duty_reply_update_email_http(
+    title: str, pipeline: str, when: str
+) -> bool:
+    """POST to duty bot — Lark often does not deliver bot→bot @mentions in groups."""
+    url = (os.getenv("DUTY_REPLY_UPDATE_URL") or "").strip()
+    if not url:
+        return False
+    token = (os.getenv("DUTY_INTERNAL_TOKEN") or "").strip()
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Duty-Internal-Token"] = token
+    payload = {
+        "chat_id": NOTIFY_CHAT_ID,
+        "email_title": (title or "").strip(),
+        "environment": (pipeline or "").strip(),
+        "when": (when or "").strip(),
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=25)
+        if resp.status_code == 200:
+            try:
+                body = resp.json()
+            except Exception:
+                body = {}
+            if body.get("ok"):
+                logger.info(
+                    "duty HTTP reply-update OK title=%r env=%r when=%r",
+                    title,
+                    pipeline,
+                    when,
+                )
+                return True
+        logger.warning(
+            "duty HTTP reply-update failed status=%s body=%s",
+            resp.status_code,
+            (resp.text or "")[:300],
+        )
+    except Exception as exc:
+        logger.warning("duty HTTP reply-update error: %s", exc)
+    return False
+
+
 def _notify_duty_after_inform_watch(
     result: str,
     meta: Dict[str, Any],
@@ -472,9 +514,10 @@ def _notify_duty_after_inform_watch(
         title = (meta.get("email_title") or "").strip()
         pipeline = (ctx.get("pipeline") or "").strip()
         when = _format_local_time_pm()
-        _send_duty_text(
-            f"/replyupdateemail | {title} | {pipeline} | {when}".strip()
-        )
+        cmd = f"/replyupdateemail | {title} | {pipeline} | {when}".strip()
+        if _notify_duty_reply_update_email_http(title, pipeline, when):
+            return
+        _send_duty_text(cmd)
     elif meta.get("mode") == "inform":
         _send_duty_text("/SuccessProceedNext")
 
