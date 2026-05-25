@@ -432,7 +432,7 @@ def _send_duty_text(text: str) -> bool:
     if not duty:
         logger.warning("DUTY_BOT_OPEN_ID missing — skip duty notify")
         return False
-    at = f"<at id={duty}></at>"
+    at = f'<at user_id="{duty}">duty bot</at>'
     return _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": f"{at} {text}".strip()})
 
 
