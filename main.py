@@ -428,12 +428,24 @@ def _format_local_time_pm() -> str:
 
 
 def _send_duty_text(text: str) -> bool:
+    plain = (text or "").strip()
+    if not plain:
+        logger.warning("empty duty notify text — skip")
+        return False
+    # Prefer plain command (no @) — Lark often skips bot→bot @mentions in groups;
+    # duty bot recognizes jenkinsbot by sender open_id + command text.
+    if _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": plain}):
+        logger.info("duty notify sent (plain): %r", plain[:120])
+        return True
     duty = (DUTY_BOT_OPEN_ID or "").strip()
     if not duty:
-        logger.warning("DUTY_BOT_OPEN_ID missing — skip duty notify")
+        logger.warning("DUTY_BOT_OPEN_ID missing — skip duty @ fallback")
         return False
     at = f'<at user_id="{duty}">duty bot</at>'
-    return _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": f"{at} {text}".strip()})
+    ok = _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": f"{at} {plain}".strip()})
+    if ok:
+        logger.info("duty notify sent (@ fallback): %r", plain[:120])
+    return ok
 
 
 def _parse_success_inform_command(text: str) -> Optional[Dict[str, Any]]:
@@ -460,13 +472,21 @@ def _parse_success_inform_command(text: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _duty_reply_update_url() -> str:
+    """Duty bot internal endpoint — default same-host when both run on OSE-Tools."""
+    url = (os.getenv("DUTY_REPLY_UPDATE_URL") or "").strip()
+    if url:
+        return url
+    host = (os.getenv("DUTY_BOT_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+    port = (os.getenv("DUTY_BOT_PORT") or os.getenv("LARKBOT_PORT") or "5000").strip()
+    return f"http://{host}:{port}/internal/reply-update-email"
+
+
 def _notify_duty_reply_update_email_http(
     title: str, pipeline: str, when: str
 ) -> bool:
-    """POST to duty bot — Lark often does not deliver bot→bot @mentions in groups."""
-    url = (os.getenv("DUTY_REPLY_UPDATE_URL") or "").strip()
-    if not url:
-        return False
+    """POST to duty bot — reliable when Lark skips bot→bot group delivery."""
+    url = _duty_reply_update_url()
     token = (os.getenv("DUTY_INTERNAL_TOKEN") or "").strip()
     headers: Dict[str, str] = {"Content-Type": "application/json"}
     if token:
@@ -486,19 +506,21 @@ def _notify_duty_reply_update_email_http(
                 body = {}
             if body.get("ok"):
                 logger.info(
-                    "duty HTTP reply-update OK title=%r env=%r when=%r",
+                    "duty HTTP reply-update OK url=%s title=%r env=%r when=%r",
+                    url,
                     title,
                     pipeline,
                     when,
                 )
                 return True
         logger.warning(
-            "duty HTTP reply-update failed status=%s body=%s",
+            "duty HTTP reply-update failed url=%s status=%s body=%s",
+            url,
             resp.status_code,
             (resp.text or "")[:300],
         )
     except Exception as exc:
-        logger.warning("duty HTTP reply-update error: %s", exc)
+        logger.warning("duty HTTP reply-update error url=%s err=%s", url, exc)
     return False
 
 
@@ -516,10 +538,24 @@ def _notify_duty_after_inform_watch(
         when = _format_local_time_pm()
         cmd = f"/replyupdateemail | {title} | {pipeline} | {when}".strip()
         if _notify_duty_reply_update_email_http(title, pipeline, when):
+            logger.info("duty bot notified via HTTP for email=%r", title)
             return
-        _send_duty_text(cmd)
+        if _send_duty_text(cmd):
+            logger.info("duty bot notified via Lark for email=%r", title)
+            return
+        warn = (
+            f"⚠️ Jenkins build SUCCESS but **could not reach duty bot** for email reply.\n"
+            f"Run manually: `{cmd}`"
+        )
+        logger.error("duty notify failed — %s", cmd)
+        _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": warn})
     elif meta.get("mode") == "inform":
-        _send_duty_text("/SuccessProceedNext")
+        if not _send_duty_text("/SuccessProceedNext"):
+            _send_chat_message(
+                NOTIFY_CHAT_ID,
+                "text",
+                {"text": "⚠️ Could not reach duty bot for `/SuccessProceedNext`"},
+            )
 
 
 def _jenkins_watch_worker(
