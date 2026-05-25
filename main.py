@@ -472,7 +472,9 @@ def _notify_duty_after_inform_watch(
         title = (meta.get("email_title") or "").strip()
         pipeline = (ctx.get("pipeline") or "").strip()
         when = _format_local_time_pm()
-        _send_duty_text(f"{title} {pipeline} {when}".strip())
+        _send_duty_text(
+            f"/replyupdateemail | {title} | {pipeline} | {when}".strip()
+        )
     elif meta.get("mode") == "inform":
         _send_duty_text("/SuccessProceedNext")
 
