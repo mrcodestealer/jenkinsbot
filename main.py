@@ -498,8 +498,8 @@ def _notify_duty_reply_update_email_http(
         "when": (when or "").strip(),
     }
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=25)
-        if resp.status_code == 200:
+        resp = requests.post(url, json=payload, headers=headers, timeout=90)
+        if resp.status_code in (200, 202):
             try:
                 body = resp.json()
             except Exception:
