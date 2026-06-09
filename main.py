@@ -161,6 +161,19 @@ def _send_chat_message(
     return True
 
 
+def _jenkins_console_text_url(job_base: str, build: int) -> str:
+    return f"{job_base.rstrip('/')}/{build}/consoleText"
+
+
+def _console_last_lines(console_text: str, *, max_lines: int = 10) -> str:
+    lines = (console_text or "").replace("\r\n", "\n").split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return ""
+    return "\n".join(lines[-max_lines:])
+
+
 def _send_done_card(
     result: str,
     console_tail: str,
@@ -169,6 +182,7 @@ def _send_done_card(
     environment: str,
     build: int,
     build_url: str,
+    console_text_url: str,
 ) -> None:
     template = "green"
     if result == "FAILURE":
@@ -178,7 +192,7 @@ def _send_done_card(
 
     # 飞书卡片 lark_md：使用 <at id=ou_xxx></at>（与 user_id 写法不同）
     at = f"<at id={NOTIFY_USER_OPEN_ID}></at>"
-    tail = console_tail[-800:] if console_tail else ""
+    tail = _console_last_lines(console_tail, max_lines=10)
     card = {
         "config": {"wide_screen_mode": True},
         "header": {
@@ -201,7 +215,8 @@ def _send_done_card(
                         f"- **Pipeline：** {pipeline}\n"
                         f"- **Build：** #{build}\n"
                         f"- **状态：** {result}\n"
-                        f"- **链接：** {build_url}\n\n"
+                        f"- **链接：** {build_url}\n"
+                        f"- **Logs :** {console_text_url}\n\n"
                         f"```\n{tail}\n```"
                     ),
                 },
@@ -355,6 +370,7 @@ def _resolve_job_context(
         "environment": env,
         "build": str(build),
         "build_url": build_url,
+        "console_text_url": _jenkins_console_text_url(job_base, build),
     }
 
 
@@ -599,6 +615,7 @@ def _jenkins_watch_worker(
                 environment=ctx["environment"],
                 build=build,
                 build_url=ctx["build_url"],
+                console_text_url=ctx["console_text_url"],
             )
             if isinstance(meta, dict) and meta.get("mode") in ("inform", "inform_time"):
                 _notify_duty_after_inform_watch(result, meta, ctx)
