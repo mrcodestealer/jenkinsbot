@@ -71,7 +71,7 @@ except ValueError:
 STUCK_SECONDS = int(_env("JENKINS_STUCK_SECONDS"))
 
 _FINISHED_RE = re.compile(
-    r"Finished:\s*(SUCCESS|FAILURE|ABORTED)\s*$", re.MULTILINE
+    r"Finished:\s*(SUCCESS|UNSTABLE|FAILURE|ABORTED)\s*$", re.MULTILINE
 )
 _URL_RE = re.compile(r"https?://[^\s<>'\"{}|\\^`\[\]]+", re.IGNORECASE)
 _SUCCESS_INFORM_TIME_RE = re.compile(r"/SuccessInformMeTime\b", re.I)
@@ -187,6 +187,8 @@ def _send_done_card(
     template = "green"
     if result == "FAILURE":
         template = "red"
+    elif result == "UNSTABLE":
+        template = "orange"
     elif result == "ABORTED":
         template = "grey"
 
