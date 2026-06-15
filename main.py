@@ -65,9 +65,34 @@ VPN_JENKINS_USER = (os.getenv("createvpnid") or "").strip()
 VPN_JENKINS_PASSWORD = (os.getenv("createvpnpass") or "").strip()
 
 
+# VPN 任务文件夹（DEVOPS_CP / VPN_CONFIGURATION / VPN_CREATION）——这些 Job 需要
+# 用 createvpnid/createvpnpass 这套账号才有 Read 权限，与所在 Jenkins 主机无关。
+_VPN_JOB_PATH_RE = re.compile(
+    r"(?i)/job/(?:DEVOPS_CP|VPN_CONFIGURATION|VPN_CREATION)\b"
+)
+
+
+def _is_vpn_job(job_base: str) -> bool:
+    try:
+        path = urlparse(job_base).path or ""
+    except Exception:
+        return False
+    return bool(_VPN_JOB_PATH_RE.search(path))
+
+
 def _auth_for(job_base: str):
+    """选择 Jenkins 凭据。
+
+    VPN 凭据（createvpnid/createvpnpass）适用于：
+      1) 旧主机 ``ose-jenkins.bewen.me``（历史规则），以及
+      2) 任意主机上的 VPN 文件夹任务（DEVOPS_CP/VPN_CONFIGURATION/VPN_CREATION）——
+         例如已迁到 ``ose-jenkinsaliyun.bewen.me`` 的 VPN_CREATION。
+    未配置 VPN 凭据时回退到默认 JENKINS_USER。
+    """
     host = (urlparse(job_base).hostname or "").lower()
-    if host == "ose-jenkins.bewen.me" and VPN_JENKINS_USER and VPN_JENKINS_PASSWORD:
+    if VPN_JENKINS_USER and VPN_JENKINS_PASSWORD and (
+        host == "ose-jenkins.bewen.me" or _is_vpn_job(job_base)
+    ):
         return (VPN_JENKINS_USER, VPN_JENKINS_PASSWORD)
     return (JENKINS_USER, JENKINS_PASSWORD)
 
@@ -94,6 +119,9 @@ _VPN_TRAILING_NUM_RE = re.compile(r"(\d+)\s*$")
 
 _watch_meta_lock = threading.Lock()
 _watch_meta: Dict[Tuple[str, int], Dict[str, Any]] = {}
+
+# 最近一次构建探测失败的可读原因（_start_jenkins_watch_from_url 写入，回复时拼接）。
+_last_probe_detail: str = ""
 
 # Dedupe Lark event re-deliveries (retries reuse the same event_id) so a retried push
 # does not start a second watch / double-reply.
@@ -310,9 +338,28 @@ def _is_jenkins_job_url(url: str) -> bool:
         return False
 
 
+_BUILD_VIEW_SUFFIX_RE = re.compile(
+    r"/(?:console(?:Text|Full)?|pipeline-console|flowGraphTable|"
+    r"api/(?:json|xml|python)|display/redirect|"
+    r"artifact(?:/.*)?|changes|testReport|parameters|allure)$",
+    re.IGNORECASE,
+)
+
+
 def _parse_job_base_and_build(url: str) -> Tuple[str, Optional[int]]:
-    """返回 (job_base_url 以 / 结尾, 可选 build 号)。若 URL 未带 build，则 build 为 None。"""
+    """返回 (job_base_url 以 / 结尾, 可选 build 号)。若 URL 未带 build，则 build 为 None。
+
+    支持链接末尾带视图/接口后缀（``/console``、``/consoleText``、``/consoleFull``、
+    ``/pipeline-console``、``/api/json``、``/display/redirect`` 等）——会先剥掉再取构建号，
+    所以直接粘贴 ``.../1066/console`` 也能解析出 #1066。
+    """
     raw = url.strip().rstrip("/")
+    # 先去掉构建号后面的视图/接口后缀（可能不止一层，例如 /1066/console）。
+    while True:
+        stripped = _BUILD_VIEW_SUFFIX_RE.sub("", raw).rstrip("/")
+        if stripped == raw:
+            break
+        raw = stripped
     m = re.search(r"/(\d+)$", raw)
     if m:
         build = int(m.group(1))
@@ -441,19 +488,34 @@ def _explicit_build_after_url(full_text: str, url: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-def _jenkins_build_exists(
+def _jenkins_build_probe(
     job_base: str, build: int, auth: Tuple[str, str]
-) -> bool:
-    """确认历史构建号存在（对应 Build History 里那一次）。"""
+) -> Tuple[bool, int]:
+    """探测历史构建号是否可访问，返回 ``(ok, http_status)``。
+
+    ``http_status`` 为实际 HTTP 状态码；网络异常时为 ``0``。调用方据此区分
+    404（确实不存在）与 401/403（鉴权/权限问题），给出可操作的提示。
+    """
     url = f"{job_base.rstrip('/')}/{build}/api/json"
     try:
         r = requests.get(url, auth=auth, timeout=20)
         if r.status_code != 200:
-            logger.warning("build api/json HTTP %s for #%s", r.status_code, build)
-        return r.status_code == 200
+            logger.warning(
+                "build api/json HTTP %s for #%s url=%s user=%s",
+                r.status_code, build, url, (auth[0] if auth else "?"),
+            )
+        return r.status_code == 200, r.status_code
     except Exception as exc:
         logger.warning("build exists check failed: %s", exc)
-        return False
+        return False, 0
+
+
+def _jenkins_build_exists(
+    job_base: str, build: int, auth: Tuple[str, str]
+) -> bool:
+    """确认历史构建号存在（对应 Build History 里那一次）。"""
+    ok, _status = _jenkins_build_probe(job_base, build, auth)
+    return ok
 
 
 def _fetch_console_text(console_url: str, auth: Tuple[str, str]) -> Optional[str]:
@@ -887,6 +949,28 @@ def _jenkins_watch_worker(
         time.sleep(POLL_SECONDS)
 
 
+def _probe_detail_or_default() -> str:
+    """返回最近一次探测失败的可读原因；没有则回退到旧的笼统提示。"""
+    return _last_probe_detail or "该 Job 下不存在或无权限查看，请核对 Build History 里的号码。"
+
+
+def _build_probe_detail(http_status: int, job_base: str, auth: Tuple[str, str]) -> str:
+    """根据 HTTP 状态码给出可操作的中文提示（区分权限 / 不存在 / 网络）。"""
+    host = (urlparse(job_base).hostname or "?")
+    user = (auth[0] if auth else "?") or "?"
+    if http_status in (401, 403):
+        return (
+            f"鉴权/权限不足（HTTP {http_status}）。当前用 `{user}` 账号访问 `{host}`，"
+            f"但该账号对此 Job 没有 Read 权限或凭据无效。"
+            "请确认 jenkinsbot 在该 Jenkins 主机上的账号/Token 及文件夹权限。"
+        )
+    if http_status == 404:
+        return "该 Job 下没有这个构建号（HTTP 404），请核对 Build History 里的号码。"
+    if http_status == 0:
+        return "网络或 Jenkins 服务器无法访问，请稍后重试或查看 jenkinsbot 日志。"
+    return f"检查失败（HTTP {http_status}），请查看 jenkinsbot 日志。"
+
+
 def _start_jenkins_watch_from_url(
     url: str,
     message_text: str = "",
@@ -897,7 +981,11 @@ def _start_jenkins_watch_from_url(
     仅监控你指定的构建号（URL 末尾 /680/ 或链接后单独写 680）。
     不再使用 lastBuild。
     返回: (status, build, pipeline, path_env_hint)
+    status: ok | no_build_number | build_not_found | build_forbidden | build_error
+    失败时把可读原因存入模块级 ``_last_probe_detail`` 供调用方拼进回复。
     """
+    global _last_probe_detail
+    _last_probe_detail = ""
     job_base, build = _parse_job_base_and_build(url)
     segments = _job_path_segments(job_base)
     pipeline, path_env = _pipeline_and_env_from_segments(segments)
@@ -913,9 +1001,17 @@ def _start_jenkins_watch_from_url(
         return "no_build_number", None, pipeline, path_env
 
     auth = _auth_for(job_base)
-    if not _jenkins_build_exists(job_base, build, auth):
-        logger.error("jenkins build #%s not found under %s", build, job_base)
-        return "build_not_found", build, pipeline, path_env
+    ok, http_status = _jenkins_build_probe(job_base, build, auth)
+    if not ok:
+        _last_probe_detail = _build_probe_detail(http_status, job_base, auth)
+        logger.error(
+            "jenkins build #%s probe failed HTTP %s under %s (user=%s)",
+            build, http_status, job_base, (auth[0] if auth else "?"),
+        )
+        status = "build_forbidden" if http_status in (401, 403) else (
+            "build_error" if http_status not in (404,) else "build_not_found"
+        )
+        return status, build, pipeline, path_env
 
     t = threading.Thread(
         target=_jenkins_watch_worker,
@@ -982,7 +1078,7 @@ def _process_message_command(text: str, message_id: str, event_chat_id: str) -> 
             else:
                 _reply_text(
                     message_id,
-                    f"VPN 构建 #{build_no} 不存在或无权限，请核对 Build History。",
+                    f"VPN 构建 #{build_no} 无法监控：{_probe_detail_or_default()}",
                 )
             return
 
@@ -1004,7 +1100,7 @@ def _process_message_command(text: str, message_id: str, event_chat_id: str) -> 
             else:
                 _reply_text(
                     message_id,
-                    f"构建 #{build_no} 不存在或无权限，请核对 Build History。",
+                    f"构建 #{build_no} 无法监控：{_probe_detail_or_default()}",
                 )
             return
 
@@ -1034,7 +1130,7 @@ def _process_message_command(text: str, message_id: str, event_chat_id: str) -> 
             else:
                 _reply_text(
                     message_id,
-                    f"构建 #{build_no} 在该 Job 下不存在或无权限查看，请核对 Build History 里的号码。",
+                    f"构建 #{build_no} 无法监控：{_probe_detail_or_default()}",
                 )
             return
 
