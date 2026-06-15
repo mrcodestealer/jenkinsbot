@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -58,6 +60,16 @@ PORT = int(_env("PORT"))
 JENKINS_USER = _env("JENKINS_USER")
 JENKINS_PASSWORD = _env("JENKINS_PASSWORD")
 
+VPN_JENKINS_USER = (os.getenv("createvpnid") or "").strip()
+VPN_JENKINS_PASSWORD = (os.getenv("createvpnpass") or "").strip()
+
+
+def _auth_for(job_base: str):
+    host = (urlparse(job_base).hostname or "").lower()
+    if host == "ose-jenkins.bewen.me" and VPN_JENKINS_USER and VPN_JENKINS_PASSWORD:
+        return (VPN_JENKINS_USER, VPN_JENKINS_PASSWORD)
+    return (JENKINS_USER, JENKINS_PASSWORD)
+
 NOTIFY_CHAT_ID = _env("NOTIFY_CHAT_ID")
 NOTIFY_USER_OPEN_ID = _env("NOTIFY_USER_OPEN_ID")
 DUTY_BOT_OPEN_ID = (os.getenv("DUTY_BOT_OPEN_ID") or "ou_1f6596a9923a2a835918e7e2513595d5").strip()
@@ -76,6 +88,8 @@ _FINISHED_RE = re.compile(
 _URL_RE = re.compile(r"https?://[^\s<>'\"{}|\\^`\[\]]+", re.IGNORECASE)
 _SUCCESS_INFORM_TIME_RE = re.compile(r"/SuccessInformMeTime\b", re.I)
 _SUCCESS_INFORM_RE = re.compile(r"/SuccessInformMe\b", re.I)
+_SUCCESS_SEND_VPN_CONF_RE = re.compile(r"/SuccessSendVpnConf\b", re.I)
+_VPN_TRAILING_NUM_RE = re.compile(r"(\d+)\s*$")
 
 _watch_meta_lock = threading.Lock()
 _watch_meta: Dict[Tuple[str, int], Dict[str, Any]] = {}
@@ -576,10 +590,222 @@ def _notify_duty_after_inform_watch(
             )
 
 
+def _vpn_trailing_number(location: str) -> str:
+    m = _VPN_TRAILING_NUM_RE.search((location or "").strip())
+    return m.group(1) if m else ""
+
+
+def _parse_send_vpn_conf_command(text: str) -> Optional[Dict[str, Any]]:
+    """Parse ``/SuccessSendVpnConf <job_url> <build> | <vpn_users> | <vpn_location>``."""
+    if not _SUCCESS_SEND_VPN_CONF_RE.search(text or ""):
+        return None
+    parts = (text or "").split("|")
+    head = parts[0]
+    vpn_users = parts[1].strip() if len(parts) > 1 else ""
+    vpn_location = parts[2].strip() if len(parts) > 2 else ""
+    vpn_users = re.sub(r"@\S+", "", vpn_users).strip()
+    vpn_location = re.sub(r"@\S+", "", vpn_location).strip()
+    urls = [u for u in _extract_urls(head) if _is_jenkins_job_url(u)]
+    if not urls:
+        return None
+    url = urls[0]
+    job_base, build = _parse_job_base_and_build(url)
+    if build is None:
+        build = _explicit_build_after_url(head, url)
+    if build is None:
+        return None
+    if not vpn_users:
+        return None
+    return {
+        "mode": "vpn_conf",
+        "job_base": job_base,
+        "build": build,
+        "vpn_users": vpn_users,
+        "vpn_location": vpn_location,
+    }
+
+
+def _list_build_artifacts(
+    job_base: str, build: int, auth: Tuple[str, str]
+) -> List[Tuple[str, str]]:
+    """Return ``[(fileName, relativePath), ...]`` from the build's artifacts API."""
+    url = (
+        f"{job_base.rstrip('/')}/{build}/api/json?tree=artifacts[fileName,relativePath]"
+    )
+    try:
+        r = requests.get(url, auth=auth, timeout=30)
+        if r.status_code != 200:
+            logger.warning("artifacts api HTTP %s url=%s", r.status_code, url)
+            return []
+        data = r.json()
+    except Exception as exc:
+        logger.warning("artifacts api failed: %s", exc)
+        return []
+    out: List[Tuple[str, str]] = []
+    for a in data.get("artifacts") or []:
+        if isinstance(a, dict):
+            fn = (a.get("fileName") or "").strip()
+            rel = (a.get("relativePath") or "").strip()
+            if fn and rel:
+                out.append((fn, rel))
+    return out
+
+
+def _pick_vpn_conf_artifact(
+    artifacts: List[Tuple[str, str]], vpn_users: str, vpn_location: str
+) -> Optional[Tuple[str, str]]:
+    """Find ``{username}{number}.conf`` (number = trailing digits of location); fall back to
+    any ``{username}*.conf`` when the location has no number (ALL / TEST_SERVER) or no exact hit."""
+    user = (vpn_users or "").strip()
+    ucf = user.casefold()
+    num = _vpn_trailing_number(vpn_location)
+    if num:
+        target = f"{user}{num}.conf".casefold()
+        for fn, rel in artifacts:
+            if fn.casefold() == target:
+                return fn, rel
+    for fn, rel in artifacts:
+        low = fn.casefold()
+        if low.endswith(".conf") and ucf and low.startswith(ucf):
+            return fn, rel
+    for fn, rel in artifacts:
+        low = fn.casefold()
+        if low.endswith(".conf") and ucf and ucf in low:
+            return fn, rel
+    return None
+
+
+def _download_artifact(
+    job_base: str, build: int, rel_path: str, auth: Tuple[str, str], dest_path: str
+) -> bool:
+    url = f"{job_base.rstrip('/')}/{build}/artifact/{rel_path}"
+    try:
+        r = requests.get(url, auth=auth, timeout=90)
+        if r.status_code != 200:
+            logger.warning("artifact download HTTP %s url=%s", r.status_code, url)
+            return False
+        with open(dest_path, "wb") as f:
+            f.write(r.content)
+        return True
+    except Exception as exc:
+        logger.exception("artifact download failed: %s", exc)
+        return False
+
+
+def _upload_file_lark(path: str, file_name: str) -> Optional[str]:
+    token = _get_tenant_access_token()
+    if not token:
+        return None
+    url = f"{LARK_HOST}/open-apis/im/v1/files"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        with open(path, "rb") as fh:
+            files = {
+                "file_type": (None, "stream"),
+                "file_name": (None, file_name),
+                "file": (file_name, fh, "application/octet-stream"),
+            }
+            resp = requests.post(url, headers=headers, files=files, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        logger.exception("upload_file_lark failed: %s", exc)
+        return None
+    if data.get("code") != 0:
+        logger.error("upload_file_lark API error: %s", data)
+        return None
+    return (data.get("data") or {}).get("file_key")
+
+
+def _send_file_message(chat_id: str, file_key: str) -> bool:
+    return _send_chat_message(chat_id, "file", {"file_key": file_key})
+
+
+def _handle_vpn_conf_after_success(
+    result: str, job_base: str, build: int, meta: Dict[str, Any]
+) -> None:
+    chat = (meta.get("chat_id") or "").strip() or NOTIFY_CHAT_ID
+    vpn_users = (meta.get("vpn_users") or "").strip()
+    vpn_location = (meta.get("vpn_location") or "").strip()
+    artifact_dir = f"{job_base.rstrip('/')}/{build}/artifact/"
+
+    if result != "SUCCESS":
+        _send_chat_message(
+            chat,
+            "text",
+            {
+                "text": (
+                    f"⚠️ VPN build #{build} finished {result} — .conf not sent. "
+                    f"请检查 console。"
+                )
+            },
+        )
+        return
+
+    auth = _auth_for(job_base)
+    artifacts = _list_build_artifacts(job_base, build, auth)
+    if not artifacts:
+        _send_chat_message(
+            chat,
+            "text",
+            {"text": f"⚠️ VPN build #{build} SUCCESS 但找不到 artifacts：{artifact_dir}"},
+        )
+        return
+
+    picked = _pick_vpn_conf_artifact(artifacts, vpn_users, vpn_location)
+    if not picked:
+        names = ", ".join(fn for fn, _ in artifacts[:20])
+        _send_chat_message(
+            chat,
+            "text",
+            {
+                "text": (
+                    f"⚠️ 没找到 {vpn_users}（{vpn_location}）对应的 .conf。\n"
+                    f"Artifacts: {names}\n{artifact_dir}"
+                )
+            },
+        )
+        return
+
+    fn, rel = picked
+    tmpdir = tempfile.mkdtemp(prefix="vpnconf_")
+    try:
+        dest = os.path.join(tmpdir, fn)
+        if not _download_artifact(job_base, build, rel, auth, dest):
+            _send_chat_message(
+                chat,
+                "text",
+                {"text": f"⚠️ 下载 {fn} 失败。手动下载：{artifact_dir}{rel}"},
+            )
+            return
+        file_key = _upload_file_lark(dest, fn)
+        if not file_key:
+            _send_chat_message(
+                chat,
+                "text",
+                {"text": f"⚠️ 上传 {fn} 到飞书失败。手动下载：{artifact_dir}{rel}"},
+            )
+            return
+        _send_chat_message(
+            chat,
+            "text",
+            {
+                "text": (
+                    f"✅ VPN created for {vpn_users} ({vpn_location}) — build #{build} SUCCESS.\n"
+                    f"配置文件：{fn}"
+                )
+            },
+        )
+        ok = _send_file_message(chat, file_key)
+        logger.info("vpn conf sent ok=%s file=%s chat=%s", ok, fn, chat)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _jenkins_watch_worker(
     job_base: str, build: int, meta: Optional[Dict[str, Any]] = None
 ) -> None:
-    auth = (JENKINS_USER, JENKINS_PASSWORD)
+    auth = _auth_for(job_base)
     console_url = f"{job_base.rstrip('/')}/{build}/consoleText"
     logger.info("jenkins watch start job_base=%s build=%s", job_base, build)
 
@@ -621,6 +847,11 @@ def _jenkins_watch_worker(
             )
             if isinstance(meta, dict) and meta.get("mode") in ("inform", "inform_time"):
                 _notify_duty_after_inform_watch(result, meta, ctx)
+            if isinstance(meta, dict) and meta.get("mode") == "vpn_conf":
+                try:
+                    _handle_vpn_conf_after_success(result, job_base, build, meta)
+                except Exception as exc:
+                    logger.exception("vpn conf handling failed: %s", exc)
             with _watch_meta_lock:
                 _watch_meta.pop((job_base, build), None)
             return
@@ -659,7 +890,7 @@ def _start_jenkins_watch_from_url(
         logger.error("no build number provided for job %s", job_base)
         return "no_build_number", None, pipeline, path_env
 
-    auth = (JENKINS_USER, JENKINS_PASSWORD)
+    auth = _auth_for(job_base)
     if not _jenkins_build_exists(job_base, build, auth):
         logger.error("jenkins build #%s not found under %s", build, job_base)
         return "build_not_found", build, pipeline, path_env
@@ -735,6 +966,7 @@ def webhook_event():
     message = event.get("message", {})
     message_id = message.get("message_id", "")
     message_type = message.get("message_type", "")
+    event_chat_id = (message.get("chat_id") or "").strip()
 
     if message_type != "text" or not message_id:
         return jsonify({"ok": True, "ignored": "non_text_or_missing_message_id"})
@@ -746,6 +978,33 @@ def webhook_event():
         event.get("message", {}).get("chat_type"),
         text[:300] if text else text,
     )
+
+    vpn = _parse_send_vpn_conf_command(text)
+    if vpn:
+        vpn["chat_id"] = event_chat_id or NOTIFY_CHAT_ID
+        url = f"{vpn['job_base'].rstrip('/')}/{vpn['build']}/"
+        status, build_no, pipeline, _path_env = _start_jenkins_watch_from_url(
+            url,
+            text,
+            meta=vpn,
+        )
+        if status == "ok":
+            _reply_text(
+                message_id,
+                f"已开始监控 VPN 构建 #{build_no}（{vpn.get('vpn_users')} / "
+                f"{vpn.get('vpn_location')}）。Finished: SUCCESS 后会下载 .conf 发到群里。",
+            )
+            return jsonify(
+                {"ok": True, "jenkins_watch": "started", "build": build_no, "mode": "vpn_conf"}
+            )
+        if status == "no_build_number":
+            _reply_text(message_id, "VPN 监控失败：缺少构建号。")
+            return jsonify({"ok": False, "jenkins_watch": "no_build_number"})
+        _reply_text(
+            message_id,
+            f"VPN 构建 #{build_no} 不存在或无权限，请核对 Build History。",
+        )
+        return jsonify({"ok": False, "jenkins_watch": "build_not_found"})
 
     inform = _parse_success_inform_command(text)
     if inform:
