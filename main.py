@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -93,6 +94,27 @@ _VPN_TRAILING_NUM_RE = re.compile(r"(\d+)\s*$")
 
 _watch_meta_lock = threading.Lock()
 _watch_meta: Dict[Tuple[str, int], Dict[str, Any]] = {}
+
+# Dedupe Lark event re-deliveries (retries reuse the same event_id) so a retried push
+# does not start a second watch / double-reply.
+_SEEN_EVENTS_MAX = 2000
+_seen_events_lock = threading.Lock()
+_seen_events = set()
+_seen_events_order = deque()
+
+
+def _event_seen_already(event_key: str) -> bool:
+    if not event_key:
+        return False
+    with _seen_events_lock:
+        if event_key in _seen_events:
+            return True
+        _seen_events.add(event_key)
+        _seen_events_order.append(event_key)
+        if len(_seen_events_order) > _SEEN_EVENTS_MAX:
+            old = _seen_events_order.popleft()
+            _seen_events.discard(old)
+        return False
 
 
 def _get_tenant_access_token() -> Optional[str]:
@@ -938,6 +960,89 @@ def healthz():
     return jsonify({"ok": True, "service": "jenkinsbot"})
 
 
+def _process_message_command(text: str, message_id: str, event_chat_id: str) -> None:
+    """Heavy work (build-exists checks, replies, watch start) — runs off the webhook thread so
+    Lark gets a fast 200 and does not retry (retries previously caused minutes-long delays)."""
+    try:
+        vpn = _parse_send_vpn_conf_command(text)
+        if vpn:
+            vpn["chat_id"] = event_chat_id or NOTIFY_CHAT_ID
+            url = f"{vpn['job_base'].rstrip('/')}/{vpn['build']}/"
+            status, build_no, _pipeline, _path_env = _start_jenkins_watch_from_url(
+                url, text, meta=vpn
+            )
+            if status == "ok":
+                _reply_text(
+                    message_id,
+                    f"已开始监控 VPN 构建 #{build_no}（{vpn.get('vpn_users')} / "
+                    f"{vpn.get('vpn_location')}）。Finished: SUCCESS 后会下载 .conf 发到群里。",
+                )
+            elif status == "no_build_number":
+                _reply_text(message_id, "VPN 监控失败：缺少构建号。")
+            else:
+                _reply_text(
+                    message_id,
+                    f"VPN 构建 #{build_no} 不存在或无权限，请核对 Build History。",
+                )
+            return
+
+        inform = _parse_success_inform_command(text)
+        if inform:
+            url = f"{inform['job_base'].rstrip('/')}/{inform['build']}/"
+            status, build_no, pipeline, _path_env = _start_jenkins_watch_from_url(
+                url, text, meta=inform
+            )
+            if status == "ok":
+                mode = inform.get("mode") or "inform"
+                _reply_text(
+                    message_id,
+                    f"已开始监控 Jenkins #{build_no}（{mode}）— Pipeline：{pipeline}。"
+                    "完成后会通知 duty bot。",
+                )
+            elif status == "no_build_number":
+                _reply_text(message_id, "请指定构建号（链接末尾 /680/ 或链接后空格写 680）。")
+            else:
+                _reply_text(
+                    message_id,
+                    f"构建 #{build_no} 不存在或无权限，请核对 Build History。",
+                )
+            return
+
+        jenkins_urls = [u for u in _extract_urls(text) if _is_jenkins_job_url(u)]
+        if jenkins_urls:
+            url = jenkins_urls[0]
+            status, build_no, pipeline, path_env = _start_jenkins_watch_from_url(url, text)
+            if status == "ok":
+                _poll_hint = (
+                    str(int(POLL_SECONDS))
+                    if float(POLL_SECONDS).is_integer()
+                    else str(POLL_SECONDS)
+                )
+                env_hint = f"，Environment（路径推测）：{path_env}" if path_env else ""
+                _reply_text(
+                    message_id,
+                    f"已开始后台监控 Jenkins #{build_no}（Pipeline：{pipeline}{env_hint}）的 "
+                    f"console（约每 {_poll_hint}s 拉取完整日志，尽快检测 Finished）。"
+                    "结束后会在目标群通知 Environment / Pipeline / 状态。",
+                )
+            elif status == "no_build_number":
+                _reply_text(
+                    message_id,
+                    "请指定历史构建号：链接末尾带 /680/，或在链接后空格写 680。"
+                    "不再自动使用最新一次构建（last build）。",
+                )
+            else:
+                _reply_text(
+                    message_id,
+                    f"构建 #{build_no} 在该 Job 下不存在或无权限查看，请核对 Build History 里的号码。",
+                )
+            return
+
+        logger.info("no command in message_id=%s", message_id)
+    except Exception as exc:
+        logger.exception("process message failed (message_id=%s): %s", message_id, exc)
+
+
 @app.post("/webhook/event")
 def webhook_event():
     payload = request.get_json(silent=True) or {}
@@ -979,106 +1084,26 @@ def webhook_event():
         text[:300] if text else text,
     )
 
-    vpn = _parse_send_vpn_conf_command(text)
-    if vpn:
-        vpn["chat_id"] = event_chat_id or NOTIFY_CHAT_ID
-        url = f"{vpn['job_base'].rstrip('/')}/{vpn['build']}/"
-        status, build_no, pipeline, _path_env = _start_jenkins_watch_from_url(
-            url,
-            text,
-            meta=vpn,
-        )
-        if status == "ok":
-            _reply_text(
-                message_id,
-                f"已开始监控 VPN 构建 #{build_no}（{vpn.get('vpn_users')} / "
-                f"{vpn.get('vpn_location')}）。Finished: SUCCESS 后会下载 .conf 发到群里。",
-            )
-            return jsonify(
-                {"ok": True, "jenkins_watch": "started", "build": build_no, "mode": "vpn_conf"}
-            )
-        if status == "no_build_number":
-            _reply_text(message_id, "VPN 监控失败：缺少构建号。")
-            return jsonify({"ok": False, "jenkins_watch": "no_build_number"})
-        _reply_text(
-            message_id,
-            f"VPN 构建 #{build_no} 不存在或无权限，请核对 Build History。",
-        )
-        return jsonify({"ok": False, "jenkins_watch": "build_not_found"})
+    # Dedupe Lark retries (same event_id) so a retried push doesn't double-watch / double-reply.
+    event_key = (
+        (payload.get("header") or {}).get("event_id")
+        or payload.get("uuid")
+        or message_id
+    )
+    if _event_seen_already(str(event_key)):
+        logger.info("duplicate event skipped key=%s message_id=%s", event_key, message_id)
+        return jsonify({"ok": True, "ignored": "duplicate"})
 
-    inform = _parse_success_inform_command(text)
-    if inform:
-        url = f"{inform['job_base'].rstrip('/')}/{inform['build']}/"
-        status, build_no, pipeline, path_env = _start_jenkins_watch_from_url(
-            url,
-            text,
-            meta=inform,
-        )
-        if status == "ok":
-            mode = inform.get("mode") or "inform"
-            _reply_text(
-                message_id,
-                f"已开始监控 Jenkins #{build_no}（{mode}）— Pipeline：{pipeline}。"
-                "完成后会通知 duty bot。",
-            )
-            return jsonify(
-                {
-                    "ok": True,
-                    "jenkins_watch": "started",
-                    "build": build_no,
-                    "pipeline": pipeline,
-                    "mode": mode,
-                }
-            )
-        if status == "no_build_number":
-            _reply_text(message_id, "请指定构建号（链接末尾 /680/ 或链接后空格写 680）。")
-            return jsonify({"ok": False, "jenkins_watch": "no_build_number"})
-        _reply_text(
-            message_id,
-            f"构建 #{build_no} 不存在或无权限，请核对 Build History。",
-        )
-        return jsonify({"ok": False, "jenkins_watch": "build_not_found"})
-
-    jenkins_urls = [u for u in _extract_urls(text) if _is_jenkins_job_url(u)]
-    if jenkins_urls:
-        url = jenkins_urls[0]
-        status, build_no, pipeline, path_env = _start_jenkins_watch_from_url(url, text)
-        if status == "ok":
-            _poll_hint = (
-                str(int(POLL_SECONDS))
-                if float(POLL_SECONDS).is_integer()
-                else str(POLL_SECONDS)
-            )
-            env_hint = f"，Environment（路径推测）：{path_env}" if path_env else ""
-            _reply_text(
-                message_id,
-                f"已开始后台监控 Jenkins #{build_no}（Pipeline：{pipeline}{env_hint}）的 "
-                f"console（约每 {_poll_hint}s 拉取完整日志，尽快检测 Finished）。"
-                "结束后会在目标群通知 Environment / Pipeline / 状态。",
-            )
-            return jsonify(
-                {
-                    "ok": True,
-                    "jenkins_watch": "started",
-                    "build": build_no,
-                    "pipeline": pipeline,
-                    "path_env": path_env,
-                }
-            )
-        if status == "no_build_number":
-            _reply_text(
-                message_id,
-                "请指定历史构建号：链接末尾带 /680/，或在链接后空格写 680。"
-                "不再自动使用最新一次构建（last build）。",
-            )
-            return jsonify({"ok": False, "jenkins_watch": "no_build_number"})
-        _reply_text(
-            message_id,
-            f"构建 #{build_no} 在该 Job 下不存在或无权限查看，请核对 Build History 里的号码。",
-        )
-        return jsonify({"ok": False, "jenkins_watch": "build_not_found"})
-
-    return jsonify({"ok": True, "ignored": "no_command"})
+    # ACK Lark immediately; do build-exists check + reply + watch start off-thread.
+    # (Previously these blocking calls ran before the 200, so a slow Jenkins/token response
+    #  delayed the ACK and Lark retried with backoff — causing minutes-long delays.)
+    threading.Thread(
+        target=_process_message_command,
+        args=(text, message_id, event_chat_id),
+        daemon=True,
+        name=f"jenkinsbot-msg-{(message_id or '')[:12]}",
+    ).start()
+    return jsonify({"ok": True, "queued": True})
 
 
 if __name__ == "__main__":
