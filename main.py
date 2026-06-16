@@ -63,6 +63,12 @@ JENKINS_PASSWORD = _env("JENKINS_PASSWORD")
 
 VPN_JENKINS_USER = (os.getenv("createvpnid") or "").strip()
 VPN_JENKINS_PASSWORD = (os.getenv("createvpnpass") or "").strip()
+# Jenkins REST API (consoleText / api/json / artifact) often rejects the web-login password and
+# requires the user's **API token** for Basic Auth. Set ``createvpntoken`` to junchen's API token;
+# it's preferred over the password for jenkinsbot's REST calls (Playwright web login still uses the
+# password on the duty bot side). Falls back to the password when unset.
+VPN_JENKINS_TOKEN = (os.getenv("createvpntoken") or "").strip()
+_VPN_JENKINS_SECRET = VPN_JENKINS_TOKEN or VPN_JENKINS_PASSWORD
 
 
 # VPN 任务文件夹（DEVOPS_CP / VPN_CONFIGURATION / VPN_CREATION）——这些 Job 需要
@@ -90,10 +96,11 @@ def _auth_for(job_base: str):
     未配置 VPN 凭据时回退到默认 JENKINS_USER。
     """
     host = (urlparse(job_base).hostname or "").lower()
-    if VPN_JENKINS_USER and VPN_JENKINS_PASSWORD and (
+    if VPN_JENKINS_USER and _VPN_JENKINS_SECRET and (
         host == "ose-jenkins.bewen.me" or _is_vpn_job(job_base)
     ):
-        return (VPN_JENKINS_USER, VPN_JENKINS_PASSWORD)
+        # Prefer createvpntoken (API token) over createvpnpass for REST Basic Auth.
+        return (VPN_JENKINS_USER, _VPN_JENKINS_SECRET)
     return (JENKINS_USER, JENKINS_PASSWORD)
 
 NOTIFY_CHAT_ID = _env("NOTIFY_CHAT_ID")
