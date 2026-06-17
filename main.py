@@ -555,20 +555,21 @@ def _send_duty_text(text: str) -> bool:
     if not plain:
         logger.warning("empty duty notify text — skip")
         return False
-    # Prefer plain command (no @) — Lark often skips bot→bot @mentions in groups;
-    # duty bot recognizes jenkinsbot by sender open_id + command text.
+    duty = (DUTY_BOT_OPEN_ID or "").strip()
+    # Prefer **@tagging** the duty bot (per request). The command text is still present, so the
+    # duty bot recognizes it by command even if Lark drops the bot→bot mention in a group.
+    if duty:
+        at = f'<at user_id="{duty}">duty bot</at>'
+        if _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": f"{at} {plain}".strip()}):
+            logger.info("duty notify sent (@tag): %r", plain[:120])
+            return True
+        logger.warning("duty @tag send failed — retrying plain")
+    else:
+        logger.warning("DUTY_BOT_OPEN_ID missing — sending duty command without @tag")
     if _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": plain}):
         logger.info("duty notify sent (plain): %r", plain[:120])
         return True
-    duty = (DUTY_BOT_OPEN_ID or "").strip()
-    if not duty:
-        logger.warning("DUTY_BOT_OPEN_ID missing — skip duty @ fallback")
-        return False
-    at = f'<at user_id="{duty}">duty bot</at>'
-    ok = _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": f"{at} {plain}".strip()})
-    if ok:
-        logger.info("duty notify sent (@ fallback): %r", plain[:120])
-    return ok
+    return False
 
 
 def _parse_success_inform_command(text: str) -> Optional[Dict[str, Any]]:
