@@ -236,6 +236,76 @@ def _jenkins_console_text_url(job_base: str, build: int) -> str:
     return f"{job_base.rstrip('/')}/{build}/consoleText"
 
 
+def _console_last_lines(console_text: str, *, max_lines: int = 10) -> str:
+    lines = (console_text or "").replace("\r\n", "\n").split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return ""
+    return "\n".join(lines[-max_lines:])
+
+
+def _send_done_card(
+    result: str,
+    console_tail: str,
+    *,
+    pipeline: str,
+    environment: str,
+    build: int,
+    build_url: str,
+    console_text_url: str,
+) -> None:
+    template = "green"
+    if result == "FAILURE":
+        template = "red"
+    elif result == "UNSTABLE":
+        template = "orange"
+    elif result == "ABORTED":
+        template = "grey"
+
+    at = f"<at id={NOTIFY_USER_OPEN_ID}></at>"
+    tail = _console_last_lines(console_tail, max_lines=10)
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": template,
+            "title": {
+                "tag": "plain_text",
+                "content": (
+                    f"Jenkins Finished: {result} | {environment} / {pipeline}"
+                ),
+            },
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        f"{at}\n**done update kindly check**\n\n"
+                        f"- **Environment：** {environment}\n"
+                        f"- **Pipeline：** {pipeline}\n"
+                        f"- **Build：** #{build}\n"
+                        f"- **状态：** {result}\n"
+                        f"- **链接：** {build_url}\n"
+                        f"- **Logs :** {console_text_url}\n\n"
+                        f"```\n{tail}\n```"
+                    ),
+                },
+            }
+        ],
+    }
+    ok = _send_chat_message(NOTIFY_CHAT_ID, "interactive", card)
+    logger.info(
+        "send_done_card interactive ok=%s result=%s env=%s pipeline=%s build=%s",
+        ok,
+        result,
+        environment,
+        pipeline,
+        build,
+    )
+
+
 def _send_done_notify(
     result: str,
     *,
@@ -243,15 +313,13 @@ def _send_done_notify(
     environment: str,
     build: int,
 ) -> None:
-    """Plain-text Jenkins finished ping (not an interactive card)."""
+    """Plain-text follow-up after the done card — no @mention."""
     when = _format_local_time_hhmm()
-    at = f"<at user_id={NOTIFY_USER_OPEN_ID}></at> " if NOTIFY_USER_OPEN_ID else ""
     if result == "SUCCESS":
         line = f"Done update at {when}. Kindly check thank you."
     else:
         line = f"Update {result.lower()} at {when}. Kindly check thank you."
-    text = f"{at}{line}".strip()
-    ok = _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": text})
+    ok = _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": line})
     logger.info(
         "send_done_notify text ok=%s result=%s env=%s pipeline=%s build=%s when=%s",
         ok,
@@ -942,6 +1010,15 @@ def _jenkins_watch_worker(
                 build,
                 ctx["environment"],
                 ctx["pipeline"],
+            )
+            _send_done_card(
+                result,
+                text or "",
+                pipeline=ctx["pipeline"],
+                environment=ctx["environment"],
+                build=build,
+                build_url=ctx["build_url"],
+                console_text_url=ctx["console_text_url"],
             )
             _send_done_notify(
                 result,
