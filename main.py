@@ -236,74 +236,30 @@ def _jenkins_console_text_url(job_base: str, build: int) -> str:
     return f"{job_base.rstrip('/')}/{build}/consoleText"
 
 
-def _console_last_lines(console_text: str, *, max_lines: int = 10) -> str:
-    lines = (console_text or "").replace("\r\n", "\n").split("\n")
-    while lines and not lines[-1].strip():
-        lines.pop()
-    if not lines:
-        return ""
-    return "\n".join(lines[-max_lines:])
-
-
-def _send_done_card(
+def _send_done_notify(
     result: str,
-    console_tail: str,
     *,
     pipeline: str,
     environment: str,
     build: int,
-    build_url: str,
-    console_text_url: str,
 ) -> None:
-    template = "green"
-    if result == "FAILURE":
-        template = "red"
-    elif result == "UNSTABLE":
-        template = "orange"
-    elif result == "ABORTED":
-        template = "grey"
-
-    # 飞书卡片 lark_md：使用 <at id=ou_xxx></at>（与 user_id 写法不同）
-    at = f"<at id={NOTIFY_USER_OPEN_ID}></at>"
-    tail = _console_last_lines(console_tail, max_lines=10)
-    card = {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "template": template,
-            "title": {
-                "tag": "plain_text",
-                "content": (
-                    f"Jenkins Finished: {result} | {environment} / {pipeline}"
-                ),
-            },
-        },
-        "elements": [
-            {
-                "tag": "div",
-                "text": {
-                    "tag": "lark_md",
-                    "content": (
-                        f"{at}\n**done update kindly check**\n\n"
-                        f"- **Environment：** {environment}\n"
-                        f"- **Pipeline：** {pipeline}\n"
-                        f"- **Build：** #{build}\n"
-                        f"- **状态：** {result}\n"
-                        f"- **链接：** {build_url}\n"
-                        f"- **Logs :** {console_text_url}\n\n"
-                        f"```\n{tail}\n```"
-                    ),
-                },
-            }
-        ],
-    }
-    ok = _send_chat_message(NOTIFY_CHAT_ID, "interactive", card)
+    """Plain-text Jenkins finished ping (not an interactive card)."""
+    when = _format_local_time_hhmm()
+    at = f"<at user_id={NOTIFY_USER_OPEN_ID}></at> " if NOTIFY_USER_OPEN_ID else ""
+    if result == "SUCCESS":
+        line = f"Done update at {when}. Kindly check thank you."
+    else:
+        line = f"Update {result.lower()} at {when}. Kindly check thank you."
+    text = f"{at}{line}".strip()
+    ok = _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": text})
     logger.info(
-        "send_done_card interactive ok=%s result=%s env=%s pipeline=%s build=%s",
+        "send_done_notify text ok=%s result=%s env=%s pipeline=%s build=%s when=%s",
         ok,
         result,
         environment,
         pipeline,
         build,
+        when,
     )
 
 
@@ -538,6 +494,17 @@ def _fetch_console_text(console_url: str, auth: Tuple[str, str]) -> Optional[str
         return None
 
 
+def _format_local_time_hhmm() -> str:
+    """Local time as ``HH:MM`` (no date, no AM/PM) — Asia/Singapore when available."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        now = datetime.now(ZoneInfo("Asia/Singapore"))
+    except Exception:
+        now = datetime.now()
+    return now.strftime("%H:%M")
+
+
 def _format_local_time_pm() -> str:
     try:
         from zoneinfo import ZoneInfo
@@ -606,6 +573,48 @@ def _duty_reply_update_url() -> str:
     return f"http://{host}:{port}/internal/reply-update-email"
 
 
+def _duty_updatemore_callback_url() -> str:
+    """Duty bot ``/FailedStop`` / ``/SuccessProceedNext`` — HTTP before Lark bot→bot."""
+    url = (os.getenv("DUTY_UPDATEMORE_CALLBACK_URL") or "").strip()
+    if url:
+        return url
+    host = (os.getenv("DUTY_BOT_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+    port = (os.getenv("DUTY_BOT_PORT") or os.getenv("LARKBOT_PORT") or "5000").strip()
+    return f"http://{host}:{port}/internal/updatemore-jenkins-callback"
+
+
+def _notify_duty_updatemore_callback_http(command: str) -> bool:
+    """POST to duty bot — reliable when Lark skips bot→bot group delivery."""
+    cmd = (command or "").strip()
+    if not cmd:
+        return False
+    url = _duty_updatemore_callback_url()
+    token = (os.getenv("DUTY_INTERNAL_TOKEN") or "").strip()
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Duty-Internal-Token"] = token
+    payload = {"chat_id": NOTIFY_CHAT_ID, "command": cmd}
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=90)
+        if resp.status_code in (200, 202):
+            try:
+                body = resp.json()
+            except Exception:
+                body = {}
+            if body.get("ok"):
+                logger.info("duty HTTP updatemore-callback OK url=%s cmd=%r", url, cmd)
+                return True
+        logger.warning(
+            "duty HTTP updatemore-callback failed url=%s status=%s body=%s",
+            url,
+            resp.status_code,
+            (resp.text or "")[:300],
+        )
+    except Exception as exc:
+        logger.warning("duty HTTP updatemore-callback error url=%s err=%s", url, exc)
+    return False
+
+
 def _notify_duty_reply_update_email_http(
     title: str, pipeline: str, when: str
 ) -> bool:
@@ -654,6 +663,9 @@ def _notify_duty_after_inform_watch(
     ctx: Dict[str, str],
 ) -> None:
     if result != "SUCCESS":
+        if _notify_duty_updatemore_callback_http("/FailedStop"):
+            logger.info("duty bot notified via HTTP for /FailedStop")
+            return
         _send_duty_text("/FailedStop")
         return
     if meta.get("mode") == "inform_time":
@@ -674,6 +686,9 @@ def _notify_duty_after_inform_watch(
         logger.error("duty notify failed — %s", cmd)
         _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": warn})
     elif meta.get("mode") == "inform":
+        if _notify_duty_updatemore_callback_http("/SuccessProceedNext"):
+            logger.info("duty bot notified via HTTP for /SuccessProceedNext")
+            return
         if not _send_duty_text("/SuccessProceedNext"):
             _send_chat_message(
                 NOTIFY_CHAT_ID,
@@ -928,14 +943,11 @@ def _jenkins_watch_worker(
                 ctx["environment"],
                 ctx["pipeline"],
             )
-            _send_done_card(
+            _send_done_notify(
                 result,
-                text or "",
                 pipeline=ctx["pipeline"],
                 environment=ctx["environment"],
                 build=build,
-                build_url=ctx["build_url"],
-                console_text_url=ctx["console_text_url"],
             )
             if isinstance(meta, dict) and meta.get("mode") in ("inform", "inform_time"):
                 _notify_duty_after_inform_watch(result, meta, ctx)
