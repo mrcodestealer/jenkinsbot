@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -41,12 +42,14 @@ if not _env_file.is_file():
     logger.warning(".env not found at %s", _env_file)
 _load_dotenv(_env_file)
 
+_CLI_TESTACCESS = "--testaccess" in sys.argv
+
 app = Flask(__name__)
 
 
 def _env(name: str) -> str:
     value = (os.getenv(name) or "").strip()
-    if not value:
+    if not value and not _CLI_TESTACCESS:
         raise RuntimeError(f"Missing {name} in .env")
     return value
 
@@ -56,7 +59,7 @@ LARK_HOST = _env("LARK_HOST").rstrip("/")
 VERIFICATION_TOKEN = _env("VERIFICATION_TOKEN")
 APP_ID = _env("APP_ID")
 APP_SECRET = _env("APP_SECRET")
-PORT = int(_env("PORT"))
+PORT = int(_env("PORT") or "5000")
 
 JENKINS_USER = _env("JENKINS_USER")
 JENKINS_PASSWORD = _env("JENKINS_PASSWORD")
@@ -149,7 +152,7 @@ try:
 except ValueError:
     POLL_SECONDS = 1.0
 
-STUCK_SECONDS = int(_env("JENKINS_STUCK_SECONDS"))
+STUCK_SECONDS = int(_env("JENKINS_STUCK_SECONDS") or "600")
 
 _FINISHED_RE = re.compile(
     r"Finished:\s*(SUCCESS|UNSTABLE|FAILURE|ABORTED)\s*$", re.MULTILINE
@@ -1362,5 +1365,119 @@ def webhook_event():
     return jsonify({"ok": True, "queued": True})
 
 
+def _mask_secret(value: str) -> str:
+    s = (value or "").strip()
+    if not s:
+        return "(not set)"
+    if len(s) <= 4:
+        return "****"
+    return f"{s[:2]}…{s[-2:]} (len={len(s)})"
+
+
+def _jenkins_rest_get(
+    url: str, auth: Tuple[str, str]
+) -> Tuple[bool, int, Optional[Dict[str, Any]], str]:
+    """GET Jenkins REST URL; return ``(ok, http_status, json_or_none, err_hint)``."""
+    try:
+        r = requests.get(url, auth=auth, timeout=25)
+    except Exception as exc:
+        return False, 0, None, str(exc)[:200]
+    if r.status_code != 200:
+        hint = _build_probe_detail(r.status_code, url, auth)
+        return False, r.status_code, None, hint
+    try:
+        return True, r.status_code, r.json(), ""
+    except Exception as exc:
+        return False, r.status_code, None, f"HTTP 200 but JSON parse failed: {exc}"
+
+
+def _parse_testaccess_build_arg(argv: List[str]) -> Optional[int]:
+    for i, arg in enumerate(argv):
+        if arg == "--build" and i + 1 < len(argv):
+            try:
+                n = int(str(argv[i + 1]).strip())
+                return n if n > 0 else None
+            except ValueError:
+                return None
+    return None
+
+
+def _run_testaccess_cli(argv: Optional[List[str]] = None) -> int:
+    """CLI: verify Jenkins REST access for VPN_CREATION (and optional build #)."""
+    argv = argv if argv is not None else sys.argv
+    job_base = VPN_CREATION_JOB_FOLDER_URL.rstrip("/") + "/"
+    job_api = (
+        f"{job_base.rstrip('/')}/api/json"
+        "?tree=name,url,color,buildable,lastBuild[number]"
+    )
+    build_no = _parse_testaccess_build_arg(argv)
+
+    print("jenkinsbot --testaccess")
+    print(f"Job: {job_base}")
+    print(f"createvpnid     = {VPN_JENKINS_USER or '(not set)'}")
+    print(f"createvpntoken  = {_mask_secret(VPN_JENKINS_TOKEN)}")
+    print(f"createvpnpass   = {_mask_secret(VPN_JENKINS_PASSWORD)}")
+    if build_no:
+        print(f"Build to probe  = #{build_no}")
+    print()
+
+    failures = 0
+    working_auth: Optional[Tuple[str, str]] = None
+    last_build: Optional[int] = None
+
+    if not VPN_JENKINS_USER:
+        print("FAIL  createvpnid is missing — set it in jenkinsbot/.env")
+        failures += 1
+    elif not VPN_JENKINS_TOKEN and not VPN_JENKINS_PASSWORD:
+        print("FAIL  createvpntoken and createvpnpass are both missing")
+        failures += 1
+    else:
+        candidates = _auth_candidates_for(job_base)
+        for i, auth in enumerate(candidates, start=1):
+            via = (
+                "createvpntoken"
+                if VPN_JENKINS_TOKEN and auth[1] == VPN_JENKINS_TOKEN
+                else "createvpnpass"
+            )
+            print(f"--- VPN credential try {i}/{len(candidates)}: {auth[0]} via {via} ---")
+            ok, status, data, hint = _jenkins_rest_get(job_api, auth)
+            if ok and isinstance(data, dict):
+                working_auth = auth
+                lb = data.get("lastBuild")
+                if isinstance(lb, dict) and lb.get("number"):
+                    last_build = int(lb["number"])
+                print(
+                    f"OK    HTTP {status}  job={data.get('name')!r}  "
+                    f"buildable={data.get('buildable')}  lastBuild=#{last_build or '?'}"
+                )
+                break
+            print(f"FAIL  HTTP {status}  {hint or 'request failed'}")
+            failures += 1
+        print()
+
+    probe_build = build_no or last_build
+    if working_auth and probe_build:
+        print(f"--- Build probe #{probe_build} ---")
+        build_api = f"{job_base.rstrip('/')}/{probe_build}/api/json?tree=number,result,building,url"
+        ok, status, data, hint = _jenkins_rest_get(build_api, working_auth)
+        if ok and isinstance(data, dict):
+            print(
+                f"OK    HTTP {status}  #{data.get('number')}  "
+                f"result={data.get('result')!r}  building={data.get('building')}"
+            )
+        else:
+            print(f"FAIL  HTTP {status}  {hint or 'request failed'}")
+            failures += 1
+        print()
+
+    if failures:
+        print("RESULT: FAIL — fix createvpnid / createvpntoken (API Token) / folder Read permission.")
+        return 1
+    print("RESULT: OK — jenkinsbot can access VPN_CREATION via REST.")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--testaccess" in sys.argv:
+        raise SystemExit(_run_testaccess_cli())
     app.run(host="0.0.0.0", port=PORT)
