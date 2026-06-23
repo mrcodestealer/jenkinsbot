@@ -293,7 +293,9 @@ def _send_done_card(
     build: int,
     build_url: str,
     console_text_url: str,
+    chat_id: Optional[str] = None,
 ) -> None:
+    target_chat = (chat_id or "").strip() or NOTIFY_CHAT_ID
     template = "green"
     if result == "FAILURE":
         template = "red"
@@ -302,7 +304,8 @@ def _send_done_card(
     elif result == "ABORTED":
         template = "grey"
 
-    at = f"<at id={NOTIFY_USER_OPEN_ID}></at>"
+    # Only @-mention the fixed duty user when posting to the default notify group.
+    at = f"<at id={NOTIFY_USER_OPEN_ID}></at>" if target_chat == NOTIFY_CHAT_ID else ""
     tail = _console_last_lines(console_tail, max_lines=10)
     card = {
         "config": {"wide_screen_mode": True},
@@ -334,14 +337,15 @@ def _send_done_card(
             }
         ],
     }
-    ok = _send_chat_message(NOTIFY_CHAT_ID, "interactive", card)
+    ok = _send_chat_message(target_chat, "interactive", card)
     logger.info(
-        "send_done_card interactive ok=%s result=%s env=%s pipeline=%s build=%s",
+        "send_done_card interactive ok=%s result=%s env=%s pipeline=%s build=%s chat=%s",
         ok,
         result,
         environment,
         pipeline,
         build,
+        target_chat,
     )
 
 
@@ -351,14 +355,16 @@ def _send_done_notify(
     pipeline: str,
     environment: str,
     build: int,
+    chat_id: Optional[str] = None,
 ) -> None:
     """Plain-text follow-up after the done card — no @mention."""
+    target_chat = (chat_id or "").strip() or NOTIFY_CHAT_ID
     when = _format_local_time_hhmm()
     if result == "SUCCESS":
         line = f"Done update at {when}. Kindly check thank you."
     else:
         line = f"Update {result.lower()} at {when}. Kindly check thank you."
-    ok = _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": line})
+    ok = _send_chat_message(target_chat, "text", {"text": line})
     logger.info(
         "send_done_notify text ok=%s result=%s env=%s pipeline=%s build=%s when=%s",
         ok,
@@ -370,8 +376,9 @@ def _send_done_notify(
     )
 
 
-def _send_stuck_card(last_snippet: str) -> None:
-    at = f"<at id={NOTIFY_USER_OPEN_ID}></at>"
+def _send_stuck_card(last_snippet: str, *, chat_id: Optional[str] = None) -> None:
+    target_chat = (chat_id or "").strip() or NOTIFY_CHAT_ID
+    at = f"<at id={NOTIFY_USER_OPEN_ID}></at>" if target_chat == NOTIFY_CHAT_ID else ""
     snippet = (last_snippet or "").strip()[-1200:]
     card = {
         "config": {"wide_screen_mode": True},
@@ -392,8 +399,8 @@ def _send_stuck_card(last_snippet: str) -> None:
             }
         ],
     }
-    ok = _send_chat_message(NOTIFY_CHAT_ID, "interactive", card)
-    logger.info("send_stuck_card ok=%s", ok)
+    ok = _send_chat_message(target_chat, "interactive", card)
+    logger.info("send_stuck_card ok=%s chat=%s", ok, target_chat)
 
 
 def _extract_urls(text: str) -> List[str]:
@@ -1044,6 +1051,11 @@ def _jenkins_watch_worker(
         if isinstance(meta, dict) and meta.get("_jenkins_auth")
         else None
     ) or _auth_for(job_base)
+    target_chat = (
+        str((meta or {}).get("chat_id") or "").strip()
+        if isinstance(meta, dict)
+        else ""
+    ) or NOTIFY_CHAT_ID
     console_url = f"{job_base.rstrip('/')}/{build}/consoleText"
     logger.info("jenkins watch start job_base=%s build=%s", job_base, build)
 
@@ -1082,12 +1094,14 @@ def _jenkins_watch_worker(
                 build=build,
                 build_url=ctx["build_url"],
                 console_text_url=ctx["console_text_url"],
+                chat_id=target_chat,
             )
             _send_done_notify(
                 result,
                 pipeline=ctx["pipeline"],
                 environment=ctx["environment"],
                 build=build,
+                chat_id=target_chat,
             )
             if isinstance(meta, dict) and meta.get("mode") in ("inform", "inform_time"):
                 _notify_duty_after_inform_watch(result, meta, ctx)
@@ -1104,7 +1118,7 @@ def _jenkins_watch_worker(
             stuck_sent = True
             tail = (text or "")[-1500:]
             logger.warning("jenkins stuck build=%s", build)
-            _send_stuck_card(tail)
+            _send_stuck_card(tail, chat_id=target_chat)
 
         time.sleep(POLL_SECONDS)
 
@@ -1247,6 +1261,7 @@ def _process_message_command(text: str, message_id: str, event_chat_id: str) -> 
 
         inform = _parse_success_inform_command(text)
         if inform:
+            inform["chat_id"] = event_chat_id or NOTIFY_CHAT_ID
             url = f"{inform['job_base'].rstrip('/')}/{inform['build']}/"
             status, build_no, pipeline, _path_env = _start_jenkins_watch_from_url(
                 url, text, meta=inform
@@ -1270,7 +1285,9 @@ def _process_message_command(text: str, message_id: str, event_chat_id: str) -> 
         jenkins_urls = [u for u in _extract_urls(text) if _is_jenkins_job_url(u)]
         if jenkins_urls:
             url = jenkins_urls[0]
-            status, build_no, pipeline, path_env = _start_jenkins_watch_from_url(url, text)
+            status, build_no, pipeline, path_env = _start_jenkins_watch_from_url(
+                url, text, meta={"mode": "watch", "chat_id": event_chat_id or NOTIFY_CHAT_ID}
+            )
             if status == "ok":
                 _poll_hint = (
                     str(int(POLL_SECONDS))
@@ -1468,6 +1485,30 @@ def _run_testaccess_cli(argv: Optional[List[str]] = None) -> int:
         else:
             print(f"FAIL  HTTP {status}  {hint or 'request failed'}")
             failures += 1
+        print()
+
+    # Download test (download only — nothing is created or sent to any chat).
+    if working_auth and probe_build:
+        print(f"--- Artifact download test (build #{probe_build}, download only) ---")
+        artifacts = _list_build_artifacts(job_base, probe_build, working_auth)
+        if not artifacts:
+            print("WARN  no artifacts on this build — try another build with --build <n>")
+        else:
+            confs = [(fn, rel) for fn, rel in artifacts if fn.casefold().endswith(".conf")]
+            picked = confs[0] if confs else artifacts[0]
+            fn, rel = picked
+            print(f"      artifacts found: {len(artifacts)}  picking: {fn}")
+            tmpdir = tempfile.mkdtemp(prefix="vpnconf_test_")
+            try:
+                dest = os.path.join(tmpdir, fn)
+                if _download_artifact(job_base, probe_build, rel, working_auth, dest):
+                    size = os.path.getsize(dest) if os.path.isfile(dest) else 0
+                    print(f"OK    downloaded {fn} ({size} bytes) — not sent anywhere.")
+                else:
+                    print(f"FAIL  could not download {fn}")
+                    failures += 1
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
         print()
 
     if failures:
