@@ -78,12 +78,27 @@ _VPN_JOB_PATH_RE = re.compile(
 )
 
 
+_VPN_JENKINS_HOSTS = frozenset(
+    {"ose-jenkins.bewen.me", "ose-jenkinsaliyun.bewen.me"}
+)
+VPN_CREATION_JOB_FOLDER_URL = (
+    "https://ose-jenkinsaliyun.bewen.me/job/DEVOPS_CP/job/VPN_CONFIGURATION/job/VPN_CREATION/"
+)
+
+
 def _is_vpn_job(job_base: str) -> bool:
     try:
         path = urlparse(job_base).path or ""
     except Exception:
         return False
     return bool(_VPN_JOB_PATH_RE.search(path))
+
+
+def _normalize_vpn_job_base(job_base: str) -> str:
+    """VPN monitoring always targets the Aliyun VPN_CREATION job folder."""
+    if _is_vpn_job(job_base):
+        return VPN_CREATION_JOB_FOLDER_URL
+    return (job_base or "").strip()
 
 
 def _auth_for(job_base: str):
@@ -97,11 +112,32 @@ def _auth_for(job_base: str):
     """
     host = (urlparse(job_base).hostname or "").lower()
     if VPN_JENKINS_USER and _VPN_JENKINS_SECRET and (
-        host == "ose-jenkins.bewen.me" or _is_vpn_job(job_base)
+        host in _VPN_JENKINS_HOSTS or _is_vpn_job(job_base)
     ):
         # Prefer createvpntoken (API token) over createvpnpass for REST Basic Auth.
         return (VPN_JENKINS_USER, _VPN_JENKINS_SECRET)
     return (JENKINS_USER, JENKINS_PASSWORD)
+
+
+def _auth_candidates_for(job_base: str) -> List[Tuple[str, str]]:
+    """Ordered Jenkins REST credentials to try (token before password for VPN jobs)."""
+    host = (urlparse(job_base).hostname or "").lower()
+    use_vpn = bool(
+        VPN_JENKINS_USER
+        and (host in _VPN_JENKINS_HOSTS or _is_vpn_job(job_base))
+    )
+    if not use_vpn:
+        return [(JENKINS_USER, JENKINS_PASSWORD)]
+    out: List[Tuple[str, str]] = []
+    if VPN_JENKINS_USER and VPN_JENKINS_TOKEN:
+        out.append((VPN_JENKINS_USER, VPN_JENKINS_TOKEN))
+    if VPN_JENKINS_USER and VPN_JENKINS_PASSWORD:
+        pair = (VPN_JENKINS_USER, VPN_JENKINS_PASSWORD)
+        if pair not in out:
+            out.append(pair)
+    if not out and VPN_JENKINS_USER and _VPN_JENKINS_SECRET:
+        out.append((VPN_JENKINS_USER, _VPN_JENKINS_SECRET))
+    return out or [(JENKINS_USER, JENKINS_PASSWORD)]
 
 NOTIFY_CHAT_ID = _env("NOTIFY_CHAT_ID")
 NOTIFY_USER_OPEN_ID = _env("NOTIFY_USER_OPEN_ID")
@@ -541,6 +577,23 @@ def _jenkins_build_probe(
         return False, 0
 
 
+def _resolve_jenkins_auth(
+    job_base: str, build: int
+) -> Tuple[Tuple[str, str], bool, int]:
+    """Try VPN/default credential candidates; return ``(auth, ok, http_status)``."""
+    job_base = _normalize_vpn_job_base(job_base)
+    last_auth = _auth_for(job_base)
+    last_status = 0
+    for auth in _auth_candidates_for(job_base):
+        ok, status = _jenkins_build_probe(job_base, build, auth)
+        last_auth, last_status = auth, status
+        if ok:
+            return auth, True, status
+        if status not in (401, 403):
+            break
+    return last_auth, False, last_status
+
+
 def _jenkins_build_exists(
     job_base: str, build: int, auth: Tuple[str, str]
 ) -> bool:
@@ -791,6 +844,7 @@ def _parse_send_vpn_conf_command(text: str) -> Optional[Dict[str, Any]]:
         return None
     if not vpn_users:
         return None
+    job_base = _normalize_vpn_job_base(job_base)
     return {
         "mode": "vpn_conf",
         "job_base": job_base,
@@ -917,7 +971,8 @@ def _handle_vpn_conf_after_success(
         )
         return
 
-    auth = _auth_for(job_base)
+    job_base = _normalize_vpn_job_base(job_base)
+    auth = meta.get("_jenkins_auth") or _auth_for(job_base)
     artifacts = _list_build_artifacts(job_base, build, auth)
     if not artifacts:
         _send_chat_message(
@@ -980,7 +1035,12 @@ def _handle_vpn_conf_after_success(
 def _jenkins_watch_worker(
     job_base: str, build: int, meta: Optional[Dict[str, Any]] = None
 ) -> None:
-    auth = _auth_for(job_base)
+    job_base = _normalize_vpn_job_base(job_base)
+    auth = (
+        (meta or {}).get("_jenkins_auth")
+        if isinstance(meta, dict) and meta.get("_jenkins_auth")
+        else None
+    ) or _auth_for(job_base)
     console_url = f"{job_base.rstrip('/')}/{build}/consoleText"
     logger.info("jenkins watch start job_base=%s build=%s", job_base, build)
 
@@ -1084,6 +1144,7 @@ def _start_jenkins_watch_from_url(
     global _last_probe_detail
     _last_probe_detail = ""
     job_base, build = _parse_job_base_and_build(url)
+    job_base = _normalize_vpn_job_base(job_base)
     segments = _job_path_segments(job_base)
     pipeline, path_env = _pipeline_and_env_from_segments(segments)
 
@@ -1097,8 +1158,7 @@ def _start_jenkins_watch_from_url(
         logger.error("no build number provided for job %s", job_base)
         return "no_build_number", None, pipeline, path_env
 
-    auth = _auth_for(job_base)
-    ok, http_status = _jenkins_build_probe(job_base, build, auth)
+    auth, ok, http_status = _resolve_jenkins_auth(job_base, build)
     if not ok:
         _last_probe_detail = _build_probe_detail(http_status, job_base, auth)
         logger.error(
@@ -1110,10 +1170,13 @@ def _start_jenkins_watch_from_url(
         )
         return status, build, pipeline, path_env
 
+    watch_meta = dict(meta) if isinstance(meta, dict) else {}
+    watch_meta["_jenkins_auth"] = auth
+
     t = threading.Thread(
         target=_jenkins_watch_worker,
         args=(job_base, build),
-        kwargs={"meta": meta},
+        kwargs={"meta": watch_meta},
         daemon=True,
         name=f"jenkins-watch-{build}",
     )
