@@ -271,6 +271,54 @@ def _send_chat_message(
     return True
 
 
+def _reply_in_thread_message(
+    message_id: str, msg_type: str, content_obj: Dict[str, Any]
+) -> bool:
+    """Reply to ``message_id`` **inside its thread** (reply_in_thread=true). Used for VPN so all
+    jenkinsbot output lands under the user's original ``create vpn`` message thread."""
+    mid = (message_id or "").strip()
+    if not mid:
+        return False
+    token = _get_tenant_access_token()
+    if not token:
+        return False
+    url = f"{LARK_HOST}/open-apis/im/v1/messages/{mid}/reply"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    body = {
+        "content": json.dumps(content_obj),
+        "msg_type": msg_type,
+        "reply_in_thread": True,
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        logger.exception("reply_in_thread failed: %s", exc)
+        return False
+    if data.get("code") != 0:
+        logger.error("reply_in_thread API error: %s", data)
+        return False
+    return True
+
+
+def _emit_message(
+    msg_type: str,
+    content_obj: Dict[str, Any],
+    *,
+    chat_id: str,
+    reply_message_id: Optional[str] = None,
+) -> bool:
+    """Thread-reply under ``reply_message_id`` when given, else plain send to ``chat_id``."""
+    rmid = (reply_message_id or "").strip()
+    if rmid and _reply_in_thread_message(rmid, msg_type, content_obj):
+        return True
+    return _send_chat_message(chat_id, msg_type, content_obj)
+
+
 def _jenkins_console_text_url(job_base: str, build: int) -> str:
     return f"{job_base.rstrip('/')}/{build}/consoleText"
 
@@ -294,6 +342,7 @@ def _send_done_card(
     build_url: str,
     console_text_url: str,
     chat_id: Optional[str] = None,
+    reply_message_id: Optional[str] = None,
 ) -> None:
     target_chat = (chat_id or "").strip() or NOTIFY_CHAT_ID
     template = "green"
@@ -304,8 +353,12 @@ def _send_done_card(
     elif result == "ABORTED":
         template = "grey"
 
-    # Only @-mention the fixed duty user when posting to the default notify group.
-    at = f"<at id={NOTIFY_USER_OPEN_ID}></at>" if target_chat == NOTIFY_CHAT_ID else ""
+    # Only @-mention the fixed duty user when posting to the default notify group (not in threads).
+    at = (
+        f"<at id={NOTIFY_USER_OPEN_ID}></at>"
+        if target_chat == NOTIFY_CHAT_ID and not (reply_message_id or "").strip()
+        else ""
+    )
     tail = _console_last_lines(console_tail, max_lines=10)
     card = {
         "config": {"wide_screen_mode": True},
@@ -337,15 +390,18 @@ def _send_done_card(
             }
         ],
     }
-    ok = _send_chat_message(target_chat, "interactive", card)
+    ok = _emit_message(
+        "interactive", card, chat_id=target_chat, reply_message_id=reply_message_id
+    )
     logger.info(
-        "send_done_card interactive ok=%s result=%s env=%s pipeline=%s build=%s chat=%s",
+        "send_done_card interactive ok=%s result=%s env=%s pipeline=%s build=%s chat=%s thread=%s",
         ok,
         result,
         environment,
         pipeline,
         build,
         target_chat,
+        bool((reply_message_id or "").strip()),
     )
 
 
@@ -356,6 +412,7 @@ def _send_done_notify(
     environment: str,
     build: int,
     chat_id: Optional[str] = None,
+    reply_message_id: Optional[str] = None,
 ) -> None:
     """Plain-text follow-up after the done card — no @mention."""
     target_chat = (chat_id or "").strip() or NOTIFY_CHAT_ID
@@ -364,7 +421,9 @@ def _send_done_notify(
         line = f"Done update at {when}. Kindly check thank you."
     else:
         line = f"Update {result.lower()} at {when}. Kindly check thank you."
-    ok = _send_chat_message(target_chat, "text", {"text": line})
+    ok = _emit_message(
+        "text", {"text": line}, chat_id=target_chat, reply_message_id=reply_message_id
+    )
     logger.info(
         "send_done_notify text ok=%s result=%s env=%s pipeline=%s build=%s when=%s",
         ok,
@@ -376,9 +435,18 @@ def _send_done_notify(
     )
 
 
-def _send_stuck_card(last_snippet: str, *, chat_id: Optional[str] = None) -> None:
+def _send_stuck_card(
+    last_snippet: str,
+    *,
+    chat_id: Optional[str] = None,
+    reply_message_id: Optional[str] = None,
+) -> None:
     target_chat = (chat_id or "").strip() or NOTIFY_CHAT_ID
-    at = f"<at id={NOTIFY_USER_OPEN_ID}></at>" if target_chat == NOTIFY_CHAT_ID else ""
+    at = (
+        f"<at id={NOTIFY_USER_OPEN_ID}></at>"
+        if target_chat == NOTIFY_CHAT_ID and not (reply_message_id or "").strip()
+        else ""
+    )
     snippet = (last_snippet or "").strip()[-1200:]
     card = {
         "config": {"wide_screen_mode": True},
@@ -399,7 +467,9 @@ def _send_stuck_card(last_snippet: str, *, chat_id: Optional[str] = None) -> Non
             }
         ],
     }
-    ok = _send_chat_message(target_chat, "interactive", card)
+    ok = _emit_message(
+        "interactive", card, chat_id=target_chat, reply_message_id=reply_message_id
+    )
     logger.info("send_stuck_card ok=%s chat=%s", ok, target_chat)
 
 
@@ -964,13 +1034,16 @@ def _handle_vpn_conf_after_success(
     result: str, job_base: str, build: int, meta: Dict[str, Any]
 ) -> None:
     chat = (meta.get("chat_id") or "").strip() or NOTIFY_CHAT_ID
+    rmid = (meta.get("reply_message_id") or "").strip() or None
     vpn_users = (meta.get("vpn_users") or "").strip()
     vpn_location = (meta.get("vpn_location") or "").strip()
     artifact_dir = f"{job_base.rstrip('/')}/{build}/artifact/"
 
+    def _out(msg_type: str, content_obj: Dict[str, Any]) -> bool:
+        return _emit_message(msg_type, content_obj, chat_id=chat, reply_message_id=rmid)
+
     if result != "SUCCESS":
-        _send_chat_message(
-            chat,
+        _out(
             "text",
             {
                 "text": (
@@ -985,8 +1058,7 @@ def _handle_vpn_conf_after_success(
     auth = meta.get("_jenkins_auth") or _auth_for(job_base)
     artifacts = _list_build_artifacts(job_base, build, auth)
     if not artifacts:
-        _send_chat_message(
-            chat,
+        _out(
             "text",
             {"text": f"⚠️ VPN build #{build} SUCCESS 但找不到 artifacts：{artifact_dir}"},
         )
@@ -995,8 +1067,7 @@ def _handle_vpn_conf_after_success(
     picked = _pick_vpn_conf_artifact(artifacts, vpn_users, vpn_location)
     if not picked:
         names = ", ".join(fn for fn, _ in artifacts[:20])
-        _send_chat_message(
-            chat,
+        _out(
             "text",
             {
                 "text": (
@@ -1012,22 +1083,19 @@ def _handle_vpn_conf_after_success(
     try:
         dest = os.path.join(tmpdir, fn)
         if not _download_artifact(job_base, build, rel, auth, dest):
-            _send_chat_message(
-                chat,
+            _out(
                 "text",
                 {"text": f"⚠️ 下载 {fn} 失败。手动下载：{artifact_dir}{rel}"},
             )
             return
         file_key = _upload_file_lark(dest, fn)
         if not file_key:
-            _send_chat_message(
-                chat,
+            _out(
                 "text",
                 {"text": f"⚠️ 上传 {fn} 到飞书失败。手动下载：{artifact_dir}{rel}"},
             )
             return
-        _send_chat_message(
-            chat,
+        _out(
             "text",
             {
                 "text": (
@@ -1036,7 +1104,7 @@ def _handle_vpn_conf_after_success(
                 )
             },
         )
-        ok = _send_file_message(chat, file_key)
+        ok = _out("file", {"file_key": file_key})
         logger.info("vpn conf sent ok=%s file=%s chat=%s", ok, fn, chat)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1056,6 +1124,12 @@ def _jenkins_watch_worker(
         if isinstance(meta, dict)
         else ""
     ) or NOTIFY_CHAT_ID
+    is_vpn_mode = isinstance(meta, dict) and meta.get("mode") == "vpn_conf"
+    reply_mid = (
+        str((meta or {}).get("reply_message_id") or "").strip()
+        if isinstance(meta, dict)
+        else ""
+    ) or None
     console_url = f"{job_base.rstrip('/')}/{build}/consoleText"
     logger.info("jenkins watch start job_base=%s build=%s", job_base, build)
 
@@ -1095,14 +1169,18 @@ def _jenkins_watch_worker(
                 build_url=ctx["build_url"],
                 console_text_url=ctx["console_text_url"],
                 chat_id=target_chat,
+                reply_message_id=reply_mid,
             )
-            _send_done_notify(
-                result,
-                pipeline=ctx["pipeline"],
-                environment=ctx["environment"],
-                build=build,
-                chat_id=target_chat,
-            )
+            # VPN: the threaded card + .conf are enough — skip the plain "Done update…" line.
+            if not is_vpn_mode:
+                _send_done_notify(
+                    result,
+                    pipeline=ctx["pipeline"],
+                    environment=ctx["environment"],
+                    build=build,
+                    chat_id=target_chat,
+                    reply_message_id=reply_mid,
+                )
             if isinstance(meta, dict) and meta.get("mode") in ("inform", "inform_time"):
                 _notify_duty_after_inform_watch(result, meta, ctx)
             if isinstance(meta, dict) and meta.get("mode") == "vpn_conf":
@@ -1118,7 +1196,7 @@ def _jenkins_watch_worker(
             stuck_sent = True
             tail = (text or "")[-1500:]
             logger.warning("jenkins stuck build=%s", build)
-            _send_stuck_card(tail, chat_id=target_chat)
+            _send_stuck_card(tail, chat_id=target_chat, reply_message_id=reply_mid)
 
         time.sleep(POLL_SECONDS)
 
@@ -1240,15 +1318,23 @@ def _process_message_command(text: str, message_id: str, event_chat_id: str) -> 
         vpn = _parse_send_vpn_conf_command(text)
         if vpn:
             vpn["chat_id"] = event_chat_id or NOTIFY_CHAT_ID
+            # Thread all VPN output under the triggering message (which the duty bot already
+            # posted inside the user's original ``create vpn`` thread).
+            vpn["reply_message_id"] = (message_id or "").strip()
             url = f"{vpn['job_base'].rstrip('/')}/{vpn['build']}/"
             status, build_no, _pipeline, _path_env = _start_jenkins_watch_from_url(
                 url, text, meta=vpn
             )
             if status == "ok":
-                _reply_text(
+                _reply_in_thread_message(
                     message_id,
-                    f"已开始监控 VPN 构建 #{build_no}（{vpn.get('vpn_users')} / "
-                    f"{vpn.get('vpn_location')}）。Finished: SUCCESS 后会下载 .conf 发到群里。",
+                    "text",
+                    {
+                        "text": (
+                            f"已开始监控 VPN 构建 #{build_no}（{vpn.get('vpn_users')} / "
+                            f"{vpn.get('vpn_location')}）。Finished: SUCCESS 后会下载 .conf 发到这里。"
+                        )
+                    },
                 )
             elif status == "no_build_number":
                 _reply_text(message_id, "VPN 监控失败：缺少构建号。")
@@ -1262,16 +1348,22 @@ def _process_message_command(text: str, message_id: str, event_chat_id: str) -> 
         inform = _parse_success_inform_command(text)
         if inform:
             inform["chat_id"] = event_chat_id or NOTIFY_CHAT_ID
+            inform["reply_message_id"] = (message_id or "").strip()
             url = f"{inform['job_base'].rstrip('/')}/{inform['build']}/"
             status, build_no, pipeline, _path_env = _start_jenkins_watch_from_url(
                 url, text, meta=inform
             )
             if status == "ok":
                 mode = inform.get("mode") or "inform"
-                _reply_text(
+                _reply_in_thread_message(
                     message_id,
-                    f"已开始监控 Jenkins #{build_no}（{mode}）— Pipeline：{pipeline}。"
-                    "完成后会通知 duty bot。",
+                    "text",
+                    {
+                        "text": (
+                            f"已开始监控 Jenkins #{build_no}（{mode}）— Pipeline：{pipeline}。"
+                            "完成后会在此线程通知。"
+                        )
+                    },
                 )
             elif status == "no_build_number":
                 _reply_text(message_id, "请指定构建号（链接末尾 /680/ 或链接后空格写 680）。")
@@ -1286,7 +1378,13 @@ def _process_message_command(text: str, message_id: str, event_chat_id: str) -> 
         if jenkins_urls:
             url = jenkins_urls[0]
             status, build_no, pipeline, path_env = _start_jenkins_watch_from_url(
-                url, text, meta={"mode": "watch", "chat_id": event_chat_id or NOTIFY_CHAT_ID}
+                url,
+                text,
+                meta={
+                    "mode": "watch",
+                    "chat_id": event_chat_id or NOTIFY_CHAT_ID,
+                    "reply_message_id": (message_id or "").strip(),
+                },
             )
             if status == "ok":
                 _poll_hint = (
@@ -1295,11 +1393,16 @@ def _process_message_command(text: str, message_id: str, event_chat_id: str) -> 
                     else str(POLL_SECONDS)
                 )
                 env_hint = f"，Environment（路径推测）：{path_env}" if path_env else ""
-                _reply_text(
+                _reply_in_thread_message(
                     message_id,
-                    f"已开始后台监控 Jenkins #{build_no}（Pipeline：{pipeline}{env_hint}）的 "
-                    f"console（约每 {_poll_hint}s 拉取完整日志，尽快检测 Finished）。"
-                    "结束后会在目标群通知 Environment / Pipeline / 状态。",
+                    "text",
+                    {
+                        "text": (
+                            f"已开始后台监控 Jenkins #{build_no}（Pipeline：{pipeline}{env_hint}）的 "
+                            f"console（约每 {_poll_hint}s 拉取完整日志，尽快检测 Finished）。"
+                            "结束后会在此线程通知 Environment / Pipeline / 状态。"
+                        )
+                    },
                 )
             elif status == "no_build_number":
                 _reply_text(
