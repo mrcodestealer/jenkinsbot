@@ -343,6 +343,7 @@ def _send_done_card(
     console_text_url: str,
     chat_id: Optional[str] = None,
     reply_message_id: Optional[str] = None,
+    vpn_mode: bool = False,
 ) -> None:
     target_chat = (chat_id or "").strip() or NOTIFY_CHAT_ID
     template = "green"
@@ -359,7 +360,33 @@ def _send_done_card(
         if target_chat == NOTIFY_CHAT_ID and not (reply_message_id or "").strip()
         else ""
     )
-    tail = _console_last_lines(console_tail, max_lines=10)
+    if vpn_mode:
+        summary = (
+            "**done created vpn**"
+            if result == "SUCCESS"
+            else f"**VPN build {result}**"
+        )
+        body = (
+            f"{at}\n{summary}\n\n"
+            f"- **Environment：** {environment}\n"
+            f"- **Pipeline：** {pipeline}\n"
+            f"- **Build：** #{build}\n"
+            f"- **状态：** {result}\n"
+            f"- **链接：** {build_url}\n"
+            f"- **Logs :** {console_text_url}"
+        )
+    else:
+        tail = _console_last_lines(console_tail, max_lines=10)
+        body = (
+            f"{at}\n**done update kindly check**\n\n"
+            f"- **Environment：** {environment}\n"
+            f"- **Pipeline：** {pipeline}\n"
+            f"- **Build：** #{build}\n"
+            f"- **状态：** {result}\n"
+            f"- **链接：** {build_url}\n"
+            f"- **Logs :** {console_text_url}\n\n"
+            f"```\n{tail}\n```"
+        )
     card = {
         "config": {"wide_screen_mode": True},
         "header": {
@@ -376,16 +403,7 @@ def _send_done_card(
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": (
-                        f"{at}\n**done update kindly check**\n\n"
-                        f"- **Environment：** {environment}\n"
-                        f"- **Pipeline：** {pipeline}\n"
-                        f"- **Build：** #{build}\n"
-                        f"- **状态：** {result}\n"
-                        f"- **链接：** {build_url}\n"
-                        f"- **Logs :** {console_text_url}\n\n"
-                        f"```\n{tail}\n```"
-                    ),
+                    "content": body,
                 },
             }
         ],
@@ -1170,6 +1188,7 @@ def _jenkins_watch_worker(
                 console_text_url=ctx["console_text_url"],
                 chat_id=target_chat,
                 reply_message_id=reply_mid,
+                vpn_mode=is_vpn_mode,
             )
             # VPN: the threaded card + .conf are enough — skip the plain "Done update…" line.
             if not is_vpn_mode:
