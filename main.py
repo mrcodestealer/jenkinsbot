@@ -145,10 +145,12 @@ def _auth_candidates_for(job_base: str) -> List[Tuple[str, str]]:
 NOTIFY_CHAT_ID = _env("NOTIFY_CHAT_ID")
 # Sole @-mention target for finished / stuck / follow-up messages (OM duty — same default as
 # osedutybot ``ose_Duty.TARGET_USER_OPEN_ID``). Override with ``JENKINS_TAG_OPEN_ID`` or ``omduty``.
+# @mention target (OM duty). ``NOTIFY_USER_OPEN_ID`` is legacy alias — still supported.
 TAG_USER_OPEN_ID = (
     (os.getenv("JENKINS_TAG_OPEN_ID") or "").strip()
     or (os.getenv("omduty") or "").strip()
     or (os.getenv("OMDUTY") or "").strip()
+    or (os.getenv("NOTIFY_USER_OPEN_ID") or "").strip()
     or "ou_d7bc33724e2d6ced4050c944c2ca5650"
 ).strip()
 # Duty Bot app id — HTTP callbacks to osedutybot only (not used for @ mentions).
@@ -1958,4 +1960,13 @@ def _run_testaccess_cli(argv: Optional[List[str]] = None) -> int:
 if __name__ == "__main__":
     if "--testaccess" in sys.argv:
         raise SystemExit(_run_testaccess_cli())
+    mode = (os.getenv("LARK_EVENT_MODE") or "webhook").strip().lower()
+    if mode == "websocket":
+        print(
+            "[jenkinsbot] LARK_EVENT_MODE=websocket — use `python run_local_bot.py` "
+            "(Flask + Lark persistent connection).",
+            flush=True,
+        )
+        raise SystemExit(1)
+    logger.info("jenkinsbot webhook mode on 0.0.0.0:%s (/webhook/event)", PORT)
     app.run(host="0.0.0.0", port=PORT)
