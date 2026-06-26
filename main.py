@@ -2524,6 +2524,12 @@ def _run_main_entry() -> int:
         _env_file,
         _env_file.is_file(),
     )
+    try:
+        from vpn_warm import prewarm_vpn_browser_on_startup
+
+        prewarm_vpn_browser_on_startup()
+    except Exception as exc:
+        logger.warning("VPN browser prewarm skipped: %s", exc)
     if _lark_uses_persistent_connection():
         if _port_in_use(PORT):
             logger.error(

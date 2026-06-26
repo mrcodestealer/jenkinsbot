@@ -1,3 +1,5 @@
 flask
 requests
 lark-oapi
+# Optional VPN browser prewarm (if not using DUTY_BOT_ROOT jenkinsupdate):
+# playwright
