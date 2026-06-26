@@ -253,6 +253,9 @@ _VPN_TRAILING_NUM_RE = re.compile(r"(\d+)\s*$")
 _watch_meta_lock = threading.Lock()
 _watch_meta: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
+_vpn_find_sessions_lock = threading.Lock()
+_vpn_find_sessions: Dict[str, Dict[str, Any]] = {}
+
 # 最近一次构建探测失败的可读原因（_start_jenkins_watch_from_url 写入，回复时拼接）。
 _last_probe_detail: str = ""
 
@@ -390,6 +393,59 @@ def _reply_in_thread_message(
         logger.error("reply_in_thread API error: %s", data)
         return False
     return True
+
+
+def _add_message_reaction(message_id: str, emoji_type: str = "OK") -> bool:
+    mid = (message_id or "").strip()
+    if not mid:
+        return False
+    token = _get_tenant_access_token()
+    if not token:
+        return False
+    url = f"{_lark_open_base()}/open-apis/im/v1/messages/{mid}/reactions"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    for et in (emoji_type, "Get", "CheckMark"):
+        body = {"reaction_type": {"emoji_type": et}}
+        try:
+            resp = requests.post(url, headers=headers, json=body, timeout=10)
+            data = resp.json() if resp.content else {}
+        except Exception as exc:
+            logger.warning("reaction %s failed: %s", et, exc)
+            continue
+        if resp.status_code == 200 and data.get("code") == 0:
+            return True
+    return False
+
+
+def _event_sender_open_id(event: Dict[str, Any]) -> str:
+    sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
+    sid = sender.get("sender_id")
+    if isinstance(sid, dict):
+        return (sid.get("open_id") or "").strip()
+    return (sender.get("open_id") or "").strip()
+
+
+def _strip_lark_mentions(text: str) -> str:
+    s = re.sub(r"<at[^>]*>.*?</at>", " ", text or "", flags=re.I)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _vpn_find_session_key(chat_id: str, sender_id: str) -> str:
+    cid = (chat_id or "").strip()
+    sid = (sender_id or "").strip()
+    return f"{cid}:{sid}" if sid else cid
+
+
+def _parse_vpn_pick_index(text: str, n_max: int) -> Optional[int]:
+    s = _strip_lark_mentions(text)
+    s = re.sub(r"@\S+", "", s).strip()
+    if not re.fullmatch(r"\d{1,2}", s):
+        return None
+    n = int(s)
+    return n if 1 <= n <= n_max else None
 
 
 def _emit_message(
@@ -1484,16 +1540,24 @@ def internal_vpn_conf_deliver():
     return jsonify({"ok": False, "error": msg}), 502
 
 
-def _process_message_command(text: str, message_id: str, event_chat_id: str) -> None:
+def _process_message_command(
+    text: str, message_id: str, event_chat_id: str, sender_id: str = ""
+) -> None:
     """Heavy work (build-exists checks, replies, watch start) — runs off the webhook thread so
     Lark gets a fast 200 and does not retry (retries previously caused minutes-long delays)."""
     try:
+        chat_id = event_chat_id or NOTIFY_CHAT_ID
+
+        if _handle_vpn_find_pick(text, chat_id, sender_id, message_id):
+            return
+
         find_q = _parse_find_vpn_conf_command(text)
         if find_q:
             _handle_find_vpn_conf_lark(
-                event_chat_id or NOTIFY_CHAT_ID,
+                chat_id,
                 find_q,
                 reply_message_id=(message_id or "").strip(),
+                sender_id=sender_id,
             )
             return
 
@@ -1662,7 +1726,7 @@ def webhook_event():
     #  delayed the ACK and Lark retried with backoff — causing minutes-long delays.)
     threading.Thread(
         target=_process_message_command,
-        args=(text, message_id, event_chat_id),
+        args=(text, message_id, event_chat_id, _event_sender_open_id(event)),
         daemon=True,
         name=f"jenkinsbot-msg-{(message_id or '')[:12]}",
     ).start()
@@ -1827,7 +1891,7 @@ def deliver_vpn_conf_file(
 
 def _parse_find_vpn_conf_command(text: str) -> Optional[str]:
     """``/FindVpnConf alex`` or ``find vpn conf alex`` → username query."""
-    raw = (text or "").strip()
+    raw = _strip_lark_mentions((text or "").strip())
     if not re.search(r"(?i)/FindVpnConf\b|find\s+vpn\s+(?:conf|file)", raw):
         return None
     m = re.search(r"(?i)/FindVpnConf\s+(\S+)", raw)
@@ -1842,17 +1906,95 @@ def _parse_find_vpn_conf_command(text: str) -> Optional[str]:
     return None
 
 
-def _handle_find_vpn_conf_lark(chat_id: str, query: str, reply_message_id: Optional[str] = None) -> None:
-    """Lark entry when duty bot @ jenkinsbot with ``/FindVpnConf <query>``."""
+def _handle_vpn_find_pick(
+    text: str, chat_id: str, sender_id: str, message_id: str
+) -> bool:
+    """Reply ``1`` / ``2`` after a multi-match VPN find list."""
+    key = _vpn_find_session_key(chat_id, sender_id)
+    with _vpn_find_sessions_lock:
+        sess = _vpn_find_sessions.get(key)
+    if not isinstance(sess, dict) or sess.get("state") != "vpn_find_pick":
+        return False
+
+    candidates = list(sess.get("candidates") or [])
+    if not candidates:
+        with _vpn_find_sessions_lock:
+            _vpn_find_sessions.pop(key, None)
+        return False
+
+    idx = _parse_vpn_pick_index(text, len(candidates))
+    if idx is None:
+        stripped = _strip_lark_mentions(text).strip()
+        if re.fullmatch(r"\d{1,2}", stripped):
+            _reply_text(
+                message_id,
+                f"⚠️ Pick **1–{len(candidates)}**, or search again with `find vpn file <name>`.",
+            )
+            return True
+        return False
+
+    row = candidates[idx - 1]
+    with _vpn_find_sessions_lock:
+        _vpn_find_sessions.pop(key, None)
+
+    _add_message_reaction(message_id, "OK")
+    _emit_message(
+        "text",
+        {"text": f"📤 Sending `{row.get('file', '?')}` — kindly wait…"},
+        chat_id=chat_id,
+        reply_message_id=message_id,
+    )
+    ok, msg = deliver_vpn_conf_file(
+        chat_id,
+        int(row["build"]),
+        str(row["relative_path"]),
+        str(row["file"]),
+        reply_message_id=message_id,
+        job_base=str(row.get("job_base") or ""),
+    )
+    if ok:
+        _emit_message(
+            "text",
+            {"text": f"✅ Sent `{msg}`."},
+            chat_id=chat_id,
+            reply_message_id=message_id,
+        )
+    else:
+        _emit_message(
+            "text",
+            {"text": f"❌ Deliver failed: {msg}"},
+            chat_id=chat_id,
+            reply_message_id=message_id,
+        )
+    return True
+
+
+def _handle_find_vpn_conf_lark(
+    chat_id: str,
+    query: str,
+    reply_message_id: Optional[str] = None,
+    sender_id: str = "",
+) -> None:
+    """Lark entry when user @ jenkinsbot with ``find vpn file <query>``."""
     q = (query or "").strip()
     if not q:
         _emit_message(
             "text",
-            {"text": "Usage: `/FindVpnConf <username>` — e.g. `/FindVpnConf alex`"},
+            {"text": "Usage: `find vpn file <name>` — e.g. `find vpn file alex`"},
             chat_id=chat_id,
             reply_message_id=reply_message_id,
         )
         return
+
+    if reply_message_id:
+        _add_message_reaction(reply_message_id, "OK")
+    _emit_message(
+        "text",
+        {"text": f"🔍 Finding VPN files matching `{q}` — kindly wait…"},
+        chat_id=chat_id,
+        reply_message_id=reply_message_id,
+    )
+
     matches = search_vpn_conf_files(q)
     if not matches:
         _emit_message(
@@ -1875,12 +2017,7 @@ def _handle_find_vpn_conf_lark(chat_id: str, query: str, reply_message_id: Optio
         if ok:
             _emit_message(
                 "text",
-                {
-                    "text": (
-                        f"✅ Sent `{msg}` (build #{row['build']}).\n"
-                        f"{row.get('artifact_url', '')}"
-                    )
-                },
+                {"text": f"✅ Sent `{msg}`."},
                 chat_id=chat_id,
                 reply_message_id=reply_message_id,
             )
@@ -1892,9 +2029,20 @@ def _handle_find_vpn_conf_lark(chat_id: str, query: str, reply_message_id: Optio
                 reply_message_id=reply_message_id,
             )
         return
-    lines = [f"🔍 **{len(matches)}** VPN `.conf` files match `{q}` — reply with a number:"]
-    for i, row in enumerate(matches[:12], start=1):
-        lines.append(f"{i}. `{row['file']}` (build #{row['build']})")
+
+    cap = min(12, len(matches))
+    lines = [f"🔍 **{cap}** VPN `.conf` files match `{q}` — reply with a number:"]
+    for i, row in enumerate(matches[:cap], start=1):
+        lines.append(f"{i}. `{row['file']}`")
+
+    key = _vpn_find_session_key(chat_id, sender_id)
+    with _vpn_find_sessions_lock:
+        _vpn_find_sessions[key] = {
+            "state": "vpn_find_pick",
+            "candidates": matches[:cap],
+            "query": q,
+        }
+
     _emit_message(
         "text",
         {"text": "\n".join(lines)},
@@ -2019,6 +2167,21 @@ def _lark_uses_persistent_connection() -> bool:
     return mode not in ("webhook", "http", "request_url", "url", "request-url")
 
 
+def _port_in_use(port: int) -> bool:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _start_flask_server() -> None:
+    try:
+        app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True, use_reloader=False)
+    except OSError as exc:
+        logger.error("Flask bind failed on 0.0.0.0:%s: %s", PORT, exc)
+        raise
+
+
 def _wait_flask_ready(timeout_sec: float = 90.0) -> bool:
     url = f"http://127.0.0.1:{PORT}/healthz"
     deadline = time.time() + timeout_sec
@@ -2064,7 +2227,7 @@ def _handle_ws_im_message(data) -> None:
     logger.info("ws im.message message_id=%s text=%r", message_id, text[:300])
     threading.Thread(
         target=_process_message_command,
-        args=(text, message_id, event_chat_id),
+        args=(text, message_id, event_chat_id, _event_sender_open_id(event)),
         daemon=True,
         name=f"jenkinsbot-ws-{(message_id or '')[:12]}",
     ).start()
@@ -2144,9 +2307,22 @@ def _run_lark_persistent_connection() -> None:
 
 
 def _run_main_entry() -> int:
+    logger.info(
+        "jenkinsbot start python=%s cwd=%s .env=%s exists=%s",
+        sys.executable,
+        os.getcwd(),
+        _env_file,
+        _env_file.is_file(),
+    )
     if _lark_uses_persistent_connection():
+        if _port_in_use(PORT):
+            logger.error(
+                "Port %s already in use — stop manual `python main.py` before systemctl start",
+                PORT,
+            )
+            return 1
         t = threading.Thread(
-            target=lambda: app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True),
+            target=_start_flask_server,
             daemon=True,
             name="jenkinsbot-flask",
         )

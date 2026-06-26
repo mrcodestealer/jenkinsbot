@@ -1,0 +1,23 @@
+[Unit]
+Description=Jenkinsbot (Flask + Lark persistent connection)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/jenkinsbot
+EnvironmentFile=-/root/jenkinsbot/.env
+
+# Use the SAME Python you tested manually (conda). If you use .venv instead, change both lines:
+ExecStart=/root/miniconda3/bin/python /root/jenkinsbot/main.py
+# ExecStart=/root/jenkinsbot/.venv/bin/python /root/jenkinsbot/main.py
+
+# Optional: SSL for lark-oapi WebSocket on some hosts
+# Environment=SSL_CERT_FILE=/root/miniconda3/lib/python3.13/site-packages/certifi/cacert.pem
+
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
