@@ -1960,34 +1960,132 @@ def _run_testaccess_cli(argv: Optional[List[str]] = None) -> int:
 
 
 def _lark_uses_persistent_connection() -> bool:
-    """Default: persistent connection (Feishu Subscription mode). Set LARK_EVENT_MODE=webhook for Request URL."""
+    """Default: persistent connection. Set LARK_EVENT_MODE=webhook for public Request URL."""
     mode = (os.getenv("LARK_EVENT_MODE") or "websocket").strip().lower()
     return mode not in ("webhook", "http", "request_url", "url", "request-url")
 
 
-def _local_webhook_url() -> str:
-    return (
-        os.getenv("LARK_LOCAL_WEBHOOK_URL") or f"http://127.0.0.1:{PORT}/webhook/event"
-    ).strip()
+def _wait_flask_ready(timeout_sec: float = 90.0) -> bool:
+    url = f"http://127.0.0.1:{PORT}/healthz"
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            r = requests.get(url, timeout=2)
+            if r.status_code < 500:
+                return True
+        except requests.RequestException:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def _handle_ws_im_message(data) -> None:
+    """Persistent connection: handle im.message.receive_v1 without HTTP loopback."""
+    try:
+        import lark_oapi as lark
+
+        raw = json.loads(lark.JSON.marshal(data))
+    except Exception as exc:
+        logger.warning("ws event marshal failed: %s", exc)
+        return
+
+    event = raw.get("event") if isinstance(raw, dict) else None
+    if not isinstance(event, dict):
+        event = raw if isinstance(raw, dict) else {}
+
+    message = event.get("message", {})
+    if not isinstance(message, dict):
+        message = {}
+    message_id = (message.get("message_id") or event.get("message_id") or "").strip()
+    message_type = message.get("message_type", "")
+    event_chat_id = (message.get("chat_id") or "").strip()
+
+    if message_type != "text" or not message_id:
+        return
+
+    text = _extract_text_message(event)
+    if not text:
+        return
+
+    logger.info("ws im.message message_id=%s text=%r", message_id, text[:300])
+    threading.Thread(
+        target=_process_message_command,
+        args=(text, message_id, event_chat_id),
+        daemon=True,
+        name=f"jenkinsbot-ws-{(message_id or '')[:12]}",
+    ).start()
+
+
+def _run_lark_persistent_connection() -> None:
+    try:
+        import lark_oapi as lark
+    except ImportError:
+        logger.error("pip install lark-oapi  (required for persistent connection)")
+        raise SystemExit(1)
+
+    encrypt_key = (
+        (os.getenv("LARK_ENCRYPT_KEY") or os.getenv("ENCRYPT_KEY") or "").strip()
+    )
+    vtoken = (VERIFICATION_TOKEN or "").strip()
+    if encrypt_key:
+        builder = lark.EventDispatcherHandler.builder(vtoken, encrypt_key)
+    else:
+        builder = lark.EventDispatcherHandler.builder("", "")
+
+    handler = builder.register_p2_im_message_receive_v1(_handle_ws_im_message).build()
+
+    domain_name = (os.getenv("LARK_DOMAIN") or "").strip().lower()
+    if not domain_name:
+        host = (LARK_HOST or "").casefold()
+        domain_name = "feishu" if "feishu.cn" in host else "lark"
+    domain = lark.FEISHU_DOMAIN if domain_name == "feishu" else lark.LARK_DOMAIN
+
+    logger.info(
+        "jenkinsbot persistent connection — domain=%s APP_ID=%s…",
+        domain_name,
+        (APP_ID or "")[:8],
+    )
+    print(
+        "[jenkinsbot] 1) Wait for: connected to wss://…\n"
+        "[jenkinsbot] 2) Then Feishu console → Events → "
+        "Receive events through persistent connection → Save",
+        flush=True,
+    )
+
+    cli = lark.ws.Client(
+        APP_ID,
+        APP_SECRET,
+        event_handler=handler,
+        log_level=lark.LogLevel.INFO,
+        domain=domain,
+    )
+    try:
+        cli.start()
+    except Exception as exc:
+        err = str(exc)
+        logger.exception("Lark WebSocket failed: %s", exc)
+        if "CERTIFICATE_VERIFY_FAILED" in err or "certificate verify failed" in err.lower():
+            print(
+                "[jenkinsbot] SSL error — try: pip install certifi && "
+                "export SSL_CERT_FILE=$(python -c \"import certifi; print(certifi.where())\")",
+                flush=True,
+            )
+        raise SystemExit(1)
 
 
 def _run_main_entry() -> int:
     if _lark_uses_persistent_connection():
-        local = _local_webhook_url()
-        logger.info(
-            "jenkinsbot persistent connection mode — Flask %s + Lark WebSocket",
-            local,
-        )
         t = threading.Thread(
             target=lambda: app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True),
             daemon=True,
             name="jenkinsbot-flask",
         )
         t.start()
-        time.sleep(2)
-        from lark_longconn import run_forever
-
-        run_forever(local_webhook_url=local)
+        if not _wait_flask_ready():
+            logger.error("Flask did not start on port %s", PORT)
+            return 1
+        logger.info("Flask ready on 0.0.0.0:%s (/healthz, /internal/*)", PORT)
+        _run_lark_persistent_connection()
         return 0
 
     logger.info("jenkinsbot webhook mode on 0.0.0.0:%s (/webhook/event)", PORT)
