@@ -1388,10 +1388,59 @@ def healthz():
     return jsonify({"ok": True, "service": "jenkinsbot"})
 
 
+@app.route("/internal/vpn-conf-search", methods=["POST"])
+def internal_vpn_conf_search():
+    """Duty bot → search old VPN ``.conf`` artifacts on VPN_CREATION (Jenkins REST)."""
+    if not _internal_api_token_ok(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    query = str(payload.get("query") or "").strip()
+    if not query:
+        return jsonify({"ok": False, "error": "query required"}), 400
+    try:
+        max_b = int(payload.get("max_builds") or 0)
+    except (TypeError, ValueError):
+        max_b = 0
+    matches = search_vpn_conf_files(query, max_builds=max_b if max_b > 0 else None)
+    return jsonify({"ok": True, "query": query, "matches": matches, "count": len(matches)})
+
+
+@app.route("/internal/vpn-conf-deliver", methods=["POST"])
+def internal_vpn_conf_deliver():
+    """Duty bot → download one artifact and send ``.conf`` file into Lark chat."""
+    if not _internal_api_token_ok(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    chat_id = str(payload.get("chat_id") or "").strip()
+    try:
+        build = int(payload.get("build") or 0)
+    except (TypeError, ValueError):
+        build = 0
+    rel = str(payload.get("relative_path") or "").strip()
+    fn = str(payload.get("file") or "").strip()
+    rmid = str(payload.get("reply_message_id") or "").strip() or None
+    jb = str(payload.get("job_base") or "").strip() or None
+    ok, msg = deliver_vpn_conf_file(
+        chat_id, build, rel, fn, reply_message_id=rmid, job_base=jb
+    )
+    if ok:
+        return jsonify({"ok": True, "file": msg})
+    return jsonify({"ok": False, "error": msg}), 502
+
+
 def _process_message_command(text: str, message_id: str, event_chat_id: str) -> None:
     """Heavy work (build-exists checks, replies, watch start) — runs off the webhook thread so
     Lark gets a fast 200 and does not retry (retries previously caused minutes-long delays)."""
     try:
+        find_q = _parse_find_vpn_conf_command(text)
+        if find_q:
+            _handle_find_vpn_conf_lark(
+                event_chat_id or NOTIFY_CHAT_ID,
+                find_q,
+                reply_message_id=(message_id or "").strip(),
+            )
+            return
+
         vpn = _parse_send_vpn_conf_command(text)
         if vpn:
             vpn["chat_id"] = event_chat_id or NOTIFY_CHAT_ID
@@ -1586,6 +1635,214 @@ def _jenkins_rest_get(
         return True, r.status_code, r.json(), ""
     except Exception as exc:
         return False, r.status_code, None, f"HTTP 200 but JSON parse failed: {exc}"
+
+
+def _internal_api_token_ok(req) -> bool:
+    need = (os.getenv("JENKINS_INTERNAL_TOKEN") or os.getenv("DUTY_INTERNAL_TOKEN") or "").strip()
+    if not need:
+        return True
+    got = (req.headers.get("X-Duty-Internal-Token") or req.headers.get("X-Jenkins-Internal-Token") or "").strip()
+    return got == need
+
+
+def _resolve_vpn_creation_auth() -> Optional[Tuple[str, Tuple[str, str]]]:
+    """Working Jenkins REST auth for VPN_CREATION (same host/credentials as create-vpn flow)."""
+    job_base = VPN_CREATION_JOB_FOLDER_URL.rstrip("/") + "/"
+    job_api = f"{job_base.rstrip('/')}/api/json?tree=lastBuild[number]"
+    for auth in _auth_candidates_for(job_base):
+        ok, _status, data, _hint = _jenkins_rest_get(job_api, auth)
+        if ok and isinstance(data, dict):
+            return job_base, auth
+    return None
+
+
+def _vpn_find_max_builds() -> int:
+    try:
+        return max(5, min(300, int(os.getenv("VPN_FIND_MAX_BUILDS", "100"))))
+    except ValueError:
+        return 100
+
+
+def _list_success_build_numbers(
+    job_base: str, auth: Tuple[str, str], *, limit: int
+) -> List[int]:
+    """Recent build numbers (newest first), SUCCESS only."""
+    url = (
+        f"{job_base.rstrip('/')}/api/json"
+        f"?tree=builds[number,result]{{0,{limit}}}"
+    )
+    ok, _status, data, _hint = _jenkins_rest_get(url, auth)
+    if not ok or not isinstance(data, dict):
+        return []
+    out: List[int] = []
+    for b in data.get("builds") or []:
+        if not isinstance(b, dict):
+            continue
+        if (b.get("result") or "").strip().upper() != "SUCCESS":
+            continue
+        try:
+            n = int(b.get("number"))
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            out.append(n)
+    out.sort(reverse=True)
+    return out
+
+
+def search_vpn_conf_files(query: str, *, max_builds: int | None = None) -> List[Dict[str, Any]]:
+    """
+    Search recent VPN_CREATION SUCCESS builds for ``.conf`` artifacts whose **filename stem**
+    contains ``query`` (case-insensitive). Returns newest build per distinct filename.
+    """
+    q = (query or "").strip()
+    if len(q) < 1:
+        return []
+    qcf = q.casefold()
+    cap = max_builds if max_builds is not None else _vpn_find_max_builds()
+    resolved = _resolve_vpn_creation_auth()
+    if not resolved:
+        return []
+    job_base, auth = resolved
+    best: Dict[str, Dict[str, Any]] = {}
+    for build in _list_success_build_numbers(job_base, auth, limit=cap):
+        for fn, rel in _list_build_artifacts(job_base, build, auth):
+            if not fn.casefold().endswith(".conf"):
+                continue
+            stem = fn[:-5].casefold() if fn.lower().endswith(".conf") else fn.casefold()
+            if qcf not in stem:
+                continue
+            prev = best.get(fn)
+            if prev is None or build > int(prev.get("build") or 0):
+                artifact_url = f"{job_base.rstrip('/')}/{build}/artifact/{rel}"
+                best[fn] = {
+                    "file": fn,
+                    "relative_path": rel,
+                    "build": build,
+                    "job_base": job_base,
+                    "artifact_url": artifact_url,
+                }
+    rows = sorted(best.values(), key=lambda r: (r["file"].casefold(), -int(r["build"])))
+    return rows
+
+
+def deliver_vpn_conf_file(
+    chat_id: str,
+    build: int,
+    relative_path: str,
+    file_name: str,
+    *,
+    reply_message_id: Optional[str] = None,
+    job_base: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Download one VPN ``.conf`` from Jenkins and send it into Lark ``chat_id``."""
+    cid = (chat_id or "").strip()
+    fn = (file_name or "").strip()
+    rel = (relative_path or "").strip()
+    if not cid or not fn or not rel or build < 1:
+        return False, "missing chat_id, build, or artifact path"
+    resolved = _resolve_vpn_creation_auth()
+    if not resolved:
+        return False, "Jenkins VPN_CREATION auth failed (check createvpnid/token)"
+    jb = (job_base or resolved[0]).rstrip("/") + "/"
+    auth = resolved[1]
+    tmpdir = tempfile.mkdtemp(prefix="vpnfind_")
+    try:
+        dest = os.path.join(tmpdir, fn)
+        if not _download_artifact(jb, build, rel, auth, dest):
+            return False, f"download failed: {jb}{build}/artifact/{rel}"
+        fkey = _upload_file_lark(dest, fn)
+        if not fkey:
+            return False, f"upload to Lark failed for {fn}"
+        ok = _emit_message(
+            "file",
+            {"file_key": fkey},
+            chat_id=cid,
+            reply_message_id=reply_message_id,
+        )
+        if not ok:
+            return False, "send file message to chat failed"
+        return True, fn
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _parse_find_vpn_conf_command(text: str) -> Optional[str]:
+    """``/FindVpnConf alex`` or ``find vpn conf alex`` → username query."""
+    raw = (text or "").strip()
+    if not re.search(r"(?i)/FindVpnConf\b|find\s+vpn\s+(?:conf|file)", raw):
+        return None
+    m = re.search(r"(?i)/FindVpnConf\s+(\S+)", raw)
+    if m:
+        return m.group(1).strip().strip(":,")
+    m2 = re.search(
+        r"(?i)(?:find|search)\s+(?:vpn\s+)?(?:conf(?:ig)?\s+)?(?:file\s+)?(?:for\s+)?(\S+)\s*$",
+        raw,
+    )
+    if m2:
+        return m2.group(1).strip().strip(":,")
+    return None
+
+
+def _handle_find_vpn_conf_lark(chat_id: str, query: str, reply_message_id: Optional[str] = None) -> None:
+    """Lark entry when duty bot @ jenkinsbot with ``/FindVpnConf <query>``."""
+    q = (query or "").strip()
+    if not q:
+        _emit_message(
+            "text",
+            {"text": "Usage: `/FindVpnConf <username>` — e.g. `/FindVpnConf alex`"},
+            chat_id=chat_id,
+            reply_message_id=reply_message_id,
+        )
+        return
+    matches = search_vpn_conf_files(q)
+    if not matches:
+        _emit_message(
+            "text",
+            {"text": f"❌ No VPN `.conf` found matching `{q}` in recent VPN_CREATION builds."},
+            chat_id=chat_id,
+            reply_message_id=reply_message_id,
+        )
+        return
+    if len(matches) == 1:
+        row = matches[0]
+        ok, msg = deliver_vpn_conf_file(
+            chat_id,
+            int(row["build"]),
+            str(row["relative_path"]),
+            str(row["file"]),
+            reply_message_id=reply_message_id,
+            job_base=str(row.get("job_base") or ""),
+        )
+        if ok:
+            _emit_message(
+                "text",
+                {
+                    "text": (
+                        f"✅ Sent `{msg}` (build #{row['build']}).\n"
+                        f"{row.get('artifact_url', '')}"
+                    )
+                },
+                chat_id=chat_id,
+                reply_message_id=reply_message_id,
+            )
+        else:
+            _emit_message(
+                "text",
+                {"text": f"❌ Found `{row['file']}` but deliver failed: {msg}"},
+                chat_id=chat_id,
+                reply_message_id=reply_message_id,
+            )
+        return
+    lines = [f"🔍 **{len(matches)}** VPN `.conf` files match `{q}` — reply with a number:"]
+    for i, row in enumerate(matches[:12], start=1):
+        lines.append(f"{i}. `{row['file']}` (build #{row['build']})")
+    _emit_message(
+        "text",
+        {"text": "\n".join(lines)},
+        chat_id=chat_id,
+        reply_message_id=reply_message_id,
+    )
 
 
 def _parse_testaccess_build_arg(argv: List[str]) -> Optional[int]:
