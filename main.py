@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import sys
 import tempfile
@@ -255,6 +256,7 @@ _watch_meta: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
 _vpn_find_sessions_lock = threading.Lock()
 _vpn_find_sessions: Dict[str, Dict[str, Any]] = {}
+_vpn_find_picker_sids: Dict[str, str] = {}
 
 # 最近一次构建探测失败的可读原因（_start_jenkins_watch_from_url 写入，回复时拼接）。
 _last_probe_detail: str = ""
@@ -437,15 +439,6 @@ def _vpn_find_session_key(chat_id: str, sender_id: str) -> str:
     cid = (chat_id or "").strip()
     sid = (sender_id or "").strip()
     return f"{cid}:{sid}" if sid else cid
-
-
-def _parse_vpn_pick_index(text: str, n_max: int) -> Optional[int]:
-    s = _strip_lark_mentions(text)
-    s = re.sub(r"@\S+", "", s).strip()
-    if not re.fullmatch(r"\d{1,2}", s):
-        return None
-    n = int(s)
-    return n if 1 <= n <= n_max else None
 
 
 def _emit_message(
@@ -1548,9 +1541,6 @@ def _process_message_command(
     try:
         chat_id = event_chat_id or NOTIFY_CHAT_ID
 
-        if _handle_vpn_find_pick(text, chat_id, sender_id, message_id):
-            return
-
         find_q = _parse_find_vpn_conf_command(text)
         if find_q:
             _handle_find_vpn_conf_lark(
@@ -1690,6 +1680,22 @@ def webhook_event():
         return jsonify({"ok": True, "ignored": "not_event_callback"})
 
     event_type = _event_type(payload)
+    if event_type in ("card.action.trigger", "card.action.trigger_v1"):
+        event_key = (
+            (payload.get("header") or {}).get("event_id")
+            or payload.get("uuid")
+            or ""
+        )
+        if event_key and _event_seen_already(str(event_key)):
+            return jsonify({})
+        threading.Thread(
+            target=_process_card_action_payload,
+            args=(payload,),
+            daemon=True,
+            name="jenkinsbot-card",
+        ).start()
+        return jsonify({})
+
     if event_type != "im.message.receive_v1":
         logger.info("ignored event_type=%s", event_type or "unknown")
         return jsonify({"ok": True, "ignored": event_type or "unknown"})
@@ -1889,6 +1895,263 @@ def deliver_vpn_conf_file(
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _vpn_find_callback_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, val in payload.items():
+        ks = str(key)
+        if isinstance(val, (dict, list)):
+            out[ks] = val
+        elif val is None:
+            out[ks] = ""
+        else:
+            out[ks] = str(val)
+    return out
+
+
+def _vpn_find_callback_button(
+    label: str,
+    btn_type: str,
+    payload: Dict[str, Any],
+    *,
+    element_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    btn: Dict[str, Any] = {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": label},
+        "type": btn_type,
+        "behaviors": [{"type": "callback", "value": _vpn_find_callback_payload(payload)}],
+    }
+    eid = (element_id or "").strip()
+    if eid:
+        btn["element_id"] = eid
+    return btn
+
+
+def _vpn_find_button_row(buttons: List[Dict[str, Any]]) -> Dict[str, Any]:
+    columns: List[Dict[str, Any]] = []
+    for btn in buttons:
+        columns.append(
+            {
+                "tag": "column",
+                "width": "auto",
+                "weight": 1,
+                "vertical_align": "top",
+                "elements": [btn],
+            }
+        )
+    return {
+        "tag": "column_set",
+        "flex_mode": "flow",
+        "background_style": "default",
+        "horizontal_spacing": "8px",
+        "columns": columns,
+    }
+
+
+def _vpn_find_pick_card(matches: List[Dict[str, Any]], query: str, *, picker_sid: str) -> Dict[str, Any]:
+    cap = min(10, len(matches))
+    buttons: List[Dict[str, Any]] = []
+    for i in range(cap):
+        row = matches[i]
+        fn = str(row.get("file") or "?")
+        label = f"{i + 1}. {fn}"[:60]
+        buttons.append(
+            _vpn_find_callback_button(
+                label,
+                "primary" if i == 0 else "default",
+                {"k": "vpn_find", "i": i + 1, "sid": picker_sid},
+                element_id=f"vpnf{i}"[:20],
+            )
+        )
+    body_elements: List[Dict[str, Any]] = [
+        {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": (
+                    f"🔍 **{cap}** VPN `.conf` files match **`{query}`** — tap one to download:"
+                ),
+            },
+        }
+    ]
+    for off in range(0, len(buttons), 3):
+        body_elements.append(_vpn_find_button_row(buttons[off : off + 3]))
+    body_elements.append({"tag": "hr"})
+    body_elements.append(
+        _vpn_find_callback_button(
+            "Cancel",
+            "default",
+            {"k": "vpn_find_cancel", "sid": picker_sid},
+            element_id="vpn_find_can",
+        )
+    )
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "width_mode": "fill"},
+        "body": {"elements": body_elements},
+    }
+
+
+def _vpn_find_register_picker(picker_sid: str, session_key: str) -> None:
+    with _vpn_find_sessions_lock:
+        _vpn_find_picker_sids[picker_sid] = session_key
+
+
+def _vpn_find_thread_root(sess: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(sess, dict):
+        return ""
+    return str(sess.get("thread_root_id") or "").strip()
+
+
+def _vpn_find_deliver_row(chat_id: str, row: Dict[str, Any], thread_root_id: str) -> None:
+    fn = str(row.get("file") or "?")
+    root = (thread_root_id or "").strip()
+    if root:
+        _emit_message(
+            "text",
+            {"text": f"📤 Sending `{fn}` — kindly wait…"},
+            chat_id=chat_id,
+            reply_message_id=root,
+        )
+    ok, msg = deliver_vpn_conf_file(
+        chat_id,
+        int(row["build"]),
+        str(row["relative_path"]),
+        str(row["file"]),
+        reply_message_id=root or None,
+        job_base=str(row.get("job_base") or ""),
+    )
+    if ok:
+        _emit_message(
+            "text",
+            {"text": f"✅ Sent `{msg}`."},
+            chat_id=chat_id,
+            reply_message_id=root or None,
+        )
+    else:
+        _emit_message(
+            "text",
+            {"text": f"❌ Deliver failed: {msg}"},
+            chat_id=chat_id,
+            reply_message_id=root or None,
+        )
+
+
+def _normalize_card_action_value(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            obj = json.loads(s)
+            return obj if isinstance(obj, dict) else None
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def _extract_card_action_fields(payload: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[str, Any]]]:
+    event = payload.get("event") if isinstance(payload.get("event"), dict) else {}
+    action = event.get("action") if isinstance(event.get("action"), dict) else {}
+    value = _normalize_card_action_value(action.get("value"))
+    if not value:
+        return None
+
+    operator = event.get("operator") if isinstance(event.get("operator"), dict) else {}
+    op_ids = operator.get("operator_id")
+    sender_id = ""
+    if isinstance(op_ids, dict):
+        sender_id = (op_ids.get("open_id") or "").strip()
+
+    context = event.get("context") if isinstance(event.get("context"), dict) else {}
+    chat_id = (
+        (context.get("open_chat_id") or context.get("chat_id") or event.get("open_chat_id") or "")
+        .strip()
+    )
+    if not chat_id:
+        return None
+    return chat_id, sender_id, value
+
+
+def _process_card_action_payload(payload: Dict[str, Any]) -> None:
+    try:
+        fields = _extract_card_action_fields(payload)
+        if not fields:
+            logger.info("card.action ignored: could not parse fields")
+            return
+        chat_id, sender_id, value = fields
+        k = str(value.get("k") or "").strip().lower()
+        sid = str(value.get("sid") or "").strip()
+
+        session_key = ""
+        if sid:
+            with _vpn_find_sessions_lock:
+                session_key = (_vpn_find_picker_sids.get(sid) or "").strip()
+        if not session_key:
+            session_key = _vpn_find_session_key(chat_id, sender_id)
+
+        with _vpn_find_sessions_lock:
+            sess = _vpn_find_sessions.get(session_key)
+        thread_root = _vpn_find_thread_root(sess)
+
+        if k == "vpn_find_cancel":
+            with _vpn_find_sessions_lock:
+                _vpn_find_sessions.pop(session_key, None)
+                if sid:
+                    _vpn_find_picker_sids.pop(sid, None)
+            if thread_root:
+                _emit_message(
+                    "text",
+                    {"text": "VPN file search cancelled."},
+                    chat_id=chat_id,
+                    reply_message_id=thread_root,
+                )
+            return
+
+        if k != "vpn_find":
+            return
+
+        try:
+            idx = int(str(value.get("i")).strip())
+        except (TypeError, ValueError):
+            return
+
+        if not isinstance(sess, dict) or sess.get("state") != "vpn_find_pick":
+            if thread_root:
+                _emit_message(
+                    "text",
+                    {"text": "⚠️ VPN find session expired — search again."},
+                    chat_id=chat_id,
+                    reply_message_id=thread_root,
+                )
+            return
+
+        candidates = list(sess.get("candidates") or [])
+        if idx < 1 or idx > len(candidates):
+            if thread_root:
+                _emit_message(
+                    "text",
+                    {"text": "⚠️ Invalid pick — try again or **Cancel**."},
+                    chat_id=chat_id,
+                    reply_message_id=thread_root,
+                )
+            return
+
+        row = candidates[idx - 1]
+        thread_root = _vpn_find_thread_root(sess) or thread_root
+        with _vpn_find_sessions_lock:
+            _vpn_find_sessions.pop(session_key, None)
+            if sid:
+                _vpn_find_picker_sids.pop(sid, None)
+        _vpn_find_deliver_row(chat_id, row, thread_root)
+    except Exception as exc:
+        logger.exception("card.action failed: %s", exc)
+
+
 def _parse_find_vpn_conf_command(text: str) -> Optional[str]:
     """``/FindVpnConf alex`` or ``find vpn conf alex`` → username query."""
     raw = _strip_lark_mentions((text or "").strip())
@@ -1906,69 +2169,6 @@ def _parse_find_vpn_conf_command(text: str) -> Optional[str]:
     return None
 
 
-def _handle_vpn_find_pick(
-    text: str, chat_id: str, sender_id: str, message_id: str
-) -> bool:
-    """Reply ``1`` / ``2`` after a multi-match VPN find list."""
-    key = _vpn_find_session_key(chat_id, sender_id)
-    with _vpn_find_sessions_lock:
-        sess = _vpn_find_sessions.get(key)
-    if not isinstance(sess, dict) or sess.get("state") != "vpn_find_pick":
-        return False
-
-    candidates = list(sess.get("candidates") or [])
-    if not candidates:
-        with _vpn_find_sessions_lock:
-            _vpn_find_sessions.pop(key, None)
-        return False
-
-    idx = _parse_vpn_pick_index(text, len(candidates))
-    if idx is None:
-        stripped = _strip_lark_mentions(text).strip()
-        if re.fullmatch(r"\d{1,2}", stripped):
-            _reply_text(
-                message_id,
-                f"⚠️ Pick **1–{len(candidates)}**, or search again with `find vpn file <name>`.",
-            )
-            return True
-        return False
-
-    row = candidates[idx - 1]
-    with _vpn_find_sessions_lock:
-        _vpn_find_sessions.pop(key, None)
-
-    _add_message_reaction(message_id, "OK")
-    _emit_message(
-        "text",
-        {"text": f"📤 Sending `{row.get('file', '?')}` — kindly wait…"},
-        chat_id=chat_id,
-        reply_message_id=message_id,
-    )
-    ok, msg = deliver_vpn_conf_file(
-        chat_id,
-        int(row["build"]),
-        str(row["relative_path"]),
-        str(row["file"]),
-        reply_message_id=message_id,
-        job_base=str(row.get("job_base") or ""),
-    )
-    if ok:
-        _emit_message(
-            "text",
-            {"text": f"✅ Sent `{msg}`."},
-            chat_id=chat_id,
-            reply_message_id=message_id,
-        )
-    else:
-        _emit_message(
-            "text",
-            {"text": f"❌ Deliver failed: {msg}"},
-            chat_id=chat_id,
-            reply_message_id=message_id,
-        )
-    return True
-
-
 def _handle_find_vpn_conf_lark(
     chat_id: str,
     query: str,
@@ -1977,22 +2177,23 @@ def _handle_find_vpn_conf_lark(
 ) -> None:
     """Lark entry when user @ jenkinsbot with ``find vpn file <query>``."""
     q = (query or "").strip()
+    thread_root = (reply_message_id or "").strip()
     if not q:
         _emit_message(
             "text",
             {"text": "Usage: `find vpn file <name>` — e.g. `find vpn file alex`"},
             chat_id=chat_id,
-            reply_message_id=reply_message_id,
+            reply_message_id=thread_root or None,
         )
         return
 
-    if reply_message_id:
-        _add_message_reaction(reply_message_id, "OK")
+    if thread_root:
+        _add_message_reaction(thread_root, "OK")
     _emit_message(
         "text",
         {"text": f"🔍 Finding VPN files matching `{q}` — kindly wait…"},
         chat_id=chat_id,
-        reply_message_id=reply_message_id,
+        reply_message_id=thread_root or None,
     )
 
     matches = search_vpn_conf_files(q)
@@ -2001,53 +2202,32 @@ def _handle_find_vpn_conf_lark(
             "text",
             {"text": f"❌ No VPN `.conf` found matching `{q}` in recent VPN_CREATION builds."},
             chat_id=chat_id,
-            reply_message_id=reply_message_id,
+            reply_message_id=thread_root or None,
         )
         return
     if len(matches) == 1:
-        row = matches[0]
-        ok, msg = deliver_vpn_conf_file(
-            chat_id,
-            int(row["build"]),
-            str(row["relative_path"]),
-            str(row["file"]),
-            reply_message_id=reply_message_id,
-            job_base=str(row.get("job_base") or ""),
-        )
-        if ok:
-            _emit_message(
-                "text",
-                {"text": f"✅ Sent `{msg}`."},
-                chat_id=chat_id,
-                reply_message_id=reply_message_id,
-            )
-        else:
-            _emit_message(
-                "text",
-                {"text": f"❌ Found `{row['file']}` but deliver failed: {msg}"},
-                chat_id=chat_id,
-                reply_message_id=reply_message_id,
-            )
+        _vpn_find_deliver_row(chat_id, matches[0], thread_root)
         return
 
-    cap = min(12, len(matches))
-    lines = [f"🔍 **{cap}** VPN `.conf` files match `{q}` — reply with a number:"]
-    for i, row in enumerate(matches[:cap], start=1):
-        lines.append(f"{i}. `{row['file']}`")
-
+    cap = min(10, len(matches))
+    picker_sid = secrets.token_hex(16)
     key = _vpn_find_session_key(chat_id, sender_id)
     with _vpn_find_sessions_lock:
         _vpn_find_sessions[key] = {
             "state": "vpn_find_pick",
             "candidates": matches[:cap],
             "query": q,
+            "thread_root_id": thread_root,
+            "picker_sid": picker_sid,
         }
+    _vpn_find_register_picker(picker_sid, key)
 
+    card = _vpn_find_pick_card(matches[:cap], q, picker_sid=picker_sid)
     _emit_message(
-        "text",
-        {"text": "\n".join(lines)},
+        "interactive",
+        card,
         chat_id=chat_id,
-        reply_message_id=reply_message_id,
+        reply_message_id=thread_root or None,
     )
 
 
@@ -2233,6 +2413,32 @@ def _handle_ws_im_message(data) -> None:
     ).start()
 
 
+def _handle_ws_card_action(data) -> None:
+    try:
+        import lark_oapi as lark
+
+        raw = json.loads(lark.JSON.marshal(data))
+    except Exception as exc:
+        logger.warning("ws card marshal failed: %s", exc)
+        return
+    if not isinstance(raw, dict):
+        return
+    if "header" in raw and "event" in raw:
+        payload = dict(raw)
+    else:
+        payload = {
+            "schema": "2.0",
+            "header": {"event_type": "card.action.trigger"},
+            "event": raw.get("event", raw),
+        }
+    threading.Thread(
+        target=_process_card_action_payload,
+        args=(payload,),
+        daemon=True,
+        name="jenkinsbot-ws-card",
+    ).start()
+
+
 def _run_lark_persistent_connection() -> None:
     global _LARK_RUNTIME_HOST
     try:
@@ -2250,7 +2456,11 @@ def _run_lark_persistent_connection() -> None:
     else:
         builder = lark.EventDispatcherHandler.builder("", "")
 
-    handler = builder.register_p2_im_message_receive_v1(_handle_ws_im_message).build()
+    handler = (
+        builder.register_p2_im_message_receive_v1(_handle_ws_im_message)
+        .register_p2_card_action_trigger(_handle_ws_card_action)
+        .build()
+    )
 
     candidates = _lark_ws_domain_candidates(lark)
     print(
