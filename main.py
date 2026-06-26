@@ -56,6 +56,7 @@ def _env(name: str) -> str:
 
 # 国内飞书 | Lark intl — 全部从 .env 读取
 LARK_HOST = _env("LARK_HOST").rstrip("/")
+_LARK_RUNTIME_HOST: Optional[str] = None
 VERIFICATION_TOKEN = _env("VERIFICATION_TOKEN")
 APP_ID = _env("APP_ID")
 APP_SECRET = _env("APP_SECRET")
@@ -87,6 +88,59 @@ _VPN_JENKINS_HOSTS = frozenset(
 VPN_CREATION_JOB_FOLDER_URL = (
     "https://ose-jenkinsaliyun.bewen.me/job/DEVOPS_CP/job/VPN_CONFIGURATION/job/VPN_CREATION/"
 )
+
+
+def _lark_open_base() -> str:
+    """Open Platform API base (feishu.cn or larksuite.com). May switch after WS auto-detect."""
+    if _LARK_RUNTIME_HOST:
+        return _LARK_RUNTIME_HOST
+    return LARK_HOST
+
+
+def _lark_ws_domain_candidates(lark_mod) -> List[Tuple[str, str]]:
+    """(label, https://open.*) try order for WebSocket — fixes 1000040351 domain mismatch."""
+    feishu = getattr(lark_mod, "FEISHU_DOMAIN", "https://open.feishu.cn").rstrip("/")
+    lark_intl = getattr(lark_mod, "LARK_DOMAIN", "https://open.larksuite.com").rstrip("/")
+
+    explicit = (
+        (os.getenv("LARK_WS_DOMAIN") or os.getenv("LARK_OPEN_BASE_URL") or "").strip().rstrip("/")
+    )
+    if explicit and not explicit.startswith("http"):
+        explicit = "https://" + explicit
+
+    ordered: List[str] = []
+    if explicit:
+        ordered.append(explicit)
+    host = (LARK_HOST or "").rstrip("/")
+    if host and host not in ordered:
+        ordered.append(host)
+
+    domain_name = (os.getenv("LARK_DOMAIN") or "").strip().lower()
+    if domain_name in ("lark", "larksuite", "intl", "international"):
+        tail = (lark_intl, feishu)
+    elif domain_name in ("feishu", "cn", "china"):
+        tail = (feishu, lark_intl)
+    elif "larksuite.com" in host or "larkoffice.com" in host:
+        tail = (lark_intl, feishu)
+    elif "feishu.cn" in host:
+        tail = (feishu, lark_intl)
+    else:
+        tail = (feishu, lark_intl)
+
+    for u in tail:
+        if u not in ordered:
+            ordered.append(u)
+
+    out: List[Tuple[str, str]] = []
+    for u in ordered:
+        label = "feishu" if "feishu.cn" in u else "lark"
+        out.append((label, u))
+    return out
+
+
+def _is_lark_domain_mismatch(exc: BaseException) -> bool:
+    s = str(exc)
+    return "1000040351" in s or "Incorrect domain name" in s
 
 
 def _is_vpn_job(job_base: str) -> bool:
@@ -229,7 +283,7 @@ def _get_tenant_access_token() -> Optional[str]:
         logger.error("APP_ID or APP_SECRET is missing.")
         return None
 
-    token_url = f"{LARK_HOST}/open-apis/auth/v3/tenant_access_token/internal"
+    token_url = f"{_lark_open_base()}/open-apis/auth/v3/tenant_access_token/internal"
     payload = {"app_id": APP_ID, "app_secret": APP_SECRET}
 
     try:
@@ -252,7 +306,7 @@ def _reply_text(message_id: str, text: str) -> bool:
     if not token:
         return False
 
-    reply_url = f"{LARK_HOST}/open-apis/im/v1/messages/{message_id}/reply"
+    reply_url = f"{_lark_open_base()}/open-apis/im/v1/messages/{message_id}/reply"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json; charset=utf-8",
@@ -281,7 +335,7 @@ def _send_chat_message(
     if not token:
         return False
 
-    url = f"{LARK_HOST}/open-apis/im/v1/messages?receive_id_type=chat_id"
+    url = f"{_lark_open_base()}/open-apis/im/v1/messages?receive_id_type=chat_id"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json; charset=utf-8",
@@ -315,7 +369,7 @@ def _reply_in_thread_message(
     token = _get_tenant_access_token()
     if not token:
         return False
-    url = f"{LARK_HOST}/open-apis/im/v1/messages/{mid}/reply"
+    url = f"{_lark_open_base()}/open-apis/im/v1/messages/{mid}/reply"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json; charset=utf-8",
@@ -1073,7 +1127,7 @@ def _upload_file_lark(path: str, file_name: str) -> Optional[str]:
     token = _get_tenant_access_token()
     if not token:
         return None
-    url = f"{LARK_HOST}/open-apis/im/v1/files"
+    url = f"{_lark_open_base()}/open-apis/im/v1/files"
     headers = {"Authorization": f"Bearer {token}"}
     try:
         with open(path, "rb") as fh:
@@ -2017,6 +2071,7 @@ def _handle_ws_im_message(data) -> None:
 
 
 def _run_lark_persistent_connection() -> None:
+    global _LARK_RUNTIME_HOST
     try:
         import lark_oapi as lark
     except ImportError:
@@ -2034,17 +2089,7 @@ def _run_lark_persistent_connection() -> None:
 
     handler = builder.register_p2_im_message_receive_v1(_handle_ws_im_message).build()
 
-    domain_name = (os.getenv("LARK_DOMAIN") or "").strip().lower()
-    if not domain_name:
-        host = (LARK_HOST or "").casefold()
-        domain_name = "feishu" if "feishu.cn" in host else "lark"
-    domain = lark.FEISHU_DOMAIN if domain_name == "feishu" else lark.LARK_DOMAIN
-
-    logger.info(
-        "jenkinsbot persistent connection — domain=%s APP_ID=%s…",
-        domain_name,
-        (APP_ID or "")[:8],
-    )
+    candidates = _lark_ws_domain_candidates(lark)
     print(
         "[jenkinsbot] 1) Wait for: connected to wss://…\n"
         "[jenkinsbot] 2) Then Feishu console → Events → "
@@ -2052,25 +2097,50 @@ def _run_lark_persistent_connection() -> None:
         flush=True,
     )
 
-    cli = lark.ws.Client(
-        APP_ID,
-        APP_SECRET,
-        event_handler=handler,
-        log_level=lark.LogLevel.INFO,
-        domain=domain,
+    last_exc: Optional[BaseException] = None
+    for label, domain_url in candidates:
+        logger.info(
+            "Trying Lark WebSocket domain=%s (%s) APP_ID=%s…",
+            domain_url,
+            label,
+            (APP_ID or "")[:8],
+        )
+        cli = lark.ws.Client(
+            APP_ID,
+            APP_SECRET,
+            event_handler=handler,
+            log_level=lark.LogLevel.INFO,
+            domain=domain_url,
+        )
+        try:
+            _LARK_RUNTIME_HOST = domain_url.rstrip("/")
+            cli.start()
+            return
+        except Exception as exc:
+            last_exc = exc
+            if _is_lark_domain_mismatch(exc):
+                logger.warning("Domain %s rejected (%s) — trying next", domain_url, exc)
+                _LARK_RUNTIME_HOST = None
+                continue
+            err = str(exc)
+            logger.exception("Lark WebSocket failed: %s", exc)
+            if "CERTIFICATE_VERIFY_FAILED" in err or "certificate verify failed" in err.lower():
+                print(
+                    "[jenkinsbot] SSL error — try: pip install certifi && "
+                    "export SSL_CERT_FILE=$(python -c \"import certifi; print(certifi.where())\")",
+                    flush=True,
+                )
+            raise SystemExit(1) from exc
+
+    logger.error("All Lark domains failed. Last error: %s", last_exc)
+    print(
+        "[jenkinsbot] 1000040351 Incorrect domain name — your APP was created on ONE of:\n"
+        "  • https://open.feishu.cn/app     → LARK_HOST=https://open.feishu.cn  LARK_DOMAIN=feishu\n"
+        "  • https://open.larksuite.com/app → LARK_HOST=https://open.larksuite.com  LARK_DOMAIN=lark\n"
+        "Open the console URL where this APP_ID exists and match LARK_HOST.",
+        flush=True,
     )
-    try:
-        cli.start()
-    except Exception as exc:
-        err = str(exc)
-        logger.exception("Lark WebSocket failed: %s", exc)
-        if "CERTIFICATE_VERIFY_FAILED" in err or "certificate verify failed" in err.lower():
-            print(
-                "[jenkinsbot] SSL error — try: pip install certifi && "
-                "export SSL_CERT_FILE=$(python -c \"import certifi; print(certifi.where())\")",
-                flush=True,
-            )
-        raise SystemExit(1)
+    raise SystemExit(1) from last_exc
 
 
 def _run_main_entry() -> int:
