@@ -143,8 +143,39 @@ def _auth_candidates_for(job_base: str) -> List[Tuple[str, str]]:
     return out or [(JENKINS_USER, JENKINS_PASSWORD)]
 
 NOTIFY_CHAT_ID = _env("NOTIFY_CHAT_ID")
-NOTIFY_USER_OPEN_ID = _env("NOTIFY_USER_OPEN_ID")
+# Sole @-mention target for finished / stuck / follow-up messages (OM duty — same default as
+# osedutybot ``ose_Duty.TARGET_USER_OPEN_ID``). Override with ``JENKINS_TAG_OPEN_ID`` or ``omduty``.
+TAG_USER_OPEN_ID = (
+    (os.getenv("JENKINS_TAG_OPEN_ID") or "").strip()
+    or (os.getenv("omduty") or "").strip()
+    or (os.getenv("OMDUTY") or "").strip()
+    or "ou_d7bc33724e2d6ced4050c944c2ca5650"
+).strip()
+# Duty Bot app id — HTTP callbacks to osedutybot only (not used for @ mentions).
 DUTY_BOT_OPEN_ID = (os.getenv("DUTY_BOT_OPEN_ID") or "ou_1f6596a9923a2a835918e7e2513595d5").strip()
+
+
+def _at_mention_card(open_id: str) -> str:
+    """``lark_md`` in interactive cards — ``<at id=ou_…></at>``."""
+    oid = (open_id or "").strip()
+    return f"<at id={oid}></at>" if oid else ""
+
+
+def _at_mention_text(open_id: str, display: str = "") -> str:
+    """Plain ``msg_type=text`` @ mention."""
+    oid = (open_id or "").strip()
+    if not oid:
+        return ""
+    label = (display or "").strip() or "duty"
+    return f'<at user_id="{oid}">{label}</at>'
+
+
+def _tag_user_at_card() -> str:
+    return _at_mention_card(TAG_USER_OPEN_ID)
+
+
+def _tag_user_at_text() -> str:
+    return _at_mention_text(TAG_USER_OPEN_ID)
 
 _POLL_RAW = _env("JENKINS_POLL_SECONDS")
 try:
@@ -354,12 +385,7 @@ def _send_done_card(
     elif result == "ABORTED":
         template = "grey"
 
-    # Only @-mention the fixed duty user when posting to the default notify group (not in threads).
-    at = (
-        f"<at id={NOTIFY_USER_OPEN_ID}></at>"
-        if target_chat == NOTIFY_CHAT_ID and not (reply_message_id or "").strip()
-        else ""
-    )
+    at = _tag_user_at_card()
     if vpn_mode:
         summary = (
             "**done created vpn**"
@@ -465,12 +491,11 @@ def _send_duty_bot_finish_tag(
 ) -> None:
     """After a Jenkins build finishes, post a message **@-tagging the duty bot** (in the same
     thread/chat as the done card). Informational only — carries no slash command."""
-    duty = (DUTY_BOT_OPEN_ID or "").strip()
-    if not duty:
-        logger.warning("DUTY_BOT_OPEN_ID missing — skip duty-bot finish tag")
+    if not TAG_USER_OPEN_ID:
+        logger.warning("TAG_USER_OPEN_ID missing — skip finish @ tag")
         return
     target_chat = (chat_id or "").strip() or NOTIFY_CHAT_ID
-    at = f'<at user_id="{duty}">duty bot</at>'
+    at = _tag_user_at_text()
     text = (
         f"{at} Jenkins Finished: {result} | {environment} / {pipeline} #{build}\n{build_url}"
     )
@@ -490,11 +515,7 @@ def _send_stuck_card(
     reply_message_id: Optional[str] = None,
 ) -> None:
     target_chat = (chat_id or "").strip() or NOTIFY_CHAT_ID
-    at = (
-        f"<at id={NOTIFY_USER_OPEN_ID}></at>"
-        if target_chat == NOTIFY_CHAT_ID and not (reply_message_id or "").strip()
-        else ""
-    )
+    at = _tag_user_at_card()
     snippet = (last_snippet or "").strip()[-1200:]
     card = {
         "config": {"wide_screen_mode": True},
@@ -771,17 +792,14 @@ def _send_duty_text(text: str) -> bool:
     if not plain:
         logger.warning("empty duty notify text — skip")
         return False
-    duty = (DUTY_BOT_OPEN_ID or "").strip()
-    # Prefer **@tagging** the duty bot (per request). The command text is still present, so the
-    # duty bot recognizes it by command even if Lark drops the bot→bot mention in a group.
-    if duty:
-        at = f'<at user_id="{duty}">duty bot</at>'
+    if TAG_USER_OPEN_ID:
+        at = _tag_user_at_text()
         if _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": f"{at} {plain}".strip()}):
             logger.info("duty notify sent (@tag): %r", plain[:120])
             return True
         logger.warning("duty @tag send failed — retrying plain")
     else:
-        logger.warning("DUTY_BOT_OPEN_ID missing — sending duty command without @tag")
+        logger.warning("TAG_USER_OPEN_ID missing — sending duty command without @tag")
     if _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": plain}):
         logger.info("duty notify sent (plain): %r", plain[:120])
         return True
