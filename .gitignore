@@ -1,0 +1,21 @@
+# Secrets — copy .env.example → .env on server; never commit real keys
+.env
+*.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Virtual envs
+venv/
+.venv/
+
+# Logs
+*.log

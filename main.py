@@ -1550,8 +1550,10 @@ def _process_message_command(text: str, message_id: str, event_chat_id: str) -> 
         logger.exception("process message failed (message_id=%s): %s", message_id, exc)
 
 
-@app.post("/webhook/event")
+@app.route("/webhook/event", methods=["POST", "GET"])
 def webhook_event():
+    if request.method == "GET":
+        return jsonify({"ok": True, "service": "jenkinsbot"})
     payload = request.get_json(silent=True) or {}
     incoming_token = payload.get("token") or payload.get("header", {}).get("token")
 
@@ -1957,16 +1959,43 @@ def _run_testaccess_cli(argv: Optional[List[str]] = None) -> int:
     return 0
 
 
+def _lark_uses_persistent_connection() -> bool:
+    """Default: persistent connection (Feishu Subscription mode). Set LARK_EVENT_MODE=webhook for Request URL."""
+    mode = (os.getenv("LARK_EVENT_MODE") or "websocket").strip().lower()
+    return mode not in ("webhook", "http", "request_url", "url", "request-url")
+
+
+def _local_webhook_url() -> str:
+    return (
+        os.getenv("LARK_LOCAL_WEBHOOK_URL") or f"http://127.0.0.1:{PORT}/webhook/event"
+    ).strip()
+
+
+def _run_main_entry() -> int:
+    if _lark_uses_persistent_connection():
+        local = _local_webhook_url()
+        logger.info(
+            "jenkinsbot persistent connection mode — Flask %s + Lark WebSocket",
+            local,
+        )
+        t = threading.Thread(
+            target=lambda: app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True),
+            daemon=True,
+            name="jenkinsbot-flask",
+        )
+        t.start()
+        time.sleep(2)
+        from lark_longconn import run_forever
+
+        run_forever(local_webhook_url=local)
+        return 0
+
+    logger.info("jenkinsbot webhook mode on 0.0.0.0:%s (/webhook/event)", PORT)
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    return 0
+
+
 if __name__ == "__main__":
     if "--testaccess" in sys.argv:
         raise SystemExit(_run_testaccess_cli())
-    mode = (os.getenv("LARK_EVENT_MODE") or "webhook").strip().lower()
-    if mode == "websocket":
-        print(
-            "[jenkinsbot] LARK_EVENT_MODE=websocket — use `python run_local_bot.py` "
-            "(Flask + Lark persistent connection).",
-            flush=True,
-        )
-        raise SystemExit(1)
-    logger.info("jenkinsbot webhook mode on 0.0.0.0:%s (/webhook/event)", PORT)
-    app.run(host="0.0.0.0", port=PORT)
+    raise SystemExit(_run_main_entry())

@@ -41,20 +41,21 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
-APP_ID = (os.getenv("APP_ID") or "").strip()
-APP_SECRET = (os.getenv("APP_SECRET") or "").strip()
-VERIFICATION_TOKEN = (os.getenv("VERIFICATION_TOKEN") or "").strip()
 _PORT = (os.getenv("PORT") or "5001").strip() or "5001"
-LOCAL_WEBHOOK = (
-    os.getenv("LARK_LOCAL_WEBHOOK_URL") or f"http://127.0.0.1:{_PORT}/webhook/event"
-).strip()
 
 
-def _wait_for_webhook(timeout_sec: float = 90.0) -> bool:
+def _local_webhook_url() -> str:
+    return (
+        os.getenv("LARK_LOCAL_WEBHOOK_URL")
+        or f"http://127.0.0.1:{_PORT}/webhook/event"
+    ).strip()
+
+
+def _wait_for_webhook(local_webhook: str, timeout_sec: float = 90.0) -> bool:
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         try:
-            r = requests.get(LOCAL_WEBHOOK, timeout=2)
+            r = requests.get(local_webhook, timeout=2)
             if r.status_code < 500:
                 return True
         except requests.RequestException:
@@ -82,7 +83,7 @@ def _ensure_inbound_message_id(payload: dict) -> dict:
     return payload
 
 
-def _to_webhook_payload(data) -> dict:
+def _to_webhook_payload(data, verification_token: str) -> dict:
     import lark_oapi as lark
 
     raw = json.loads(lark.JSON.marshal(data))
@@ -102,40 +103,48 @@ def _to_webhook_payload(data) -> dict:
             "event": inner,
         }
 
-    if VERIFICATION_TOKEN:
+    if verification_token:
         hdr = payload.setdefault("header", {})
         if not str(hdr.get("token") or "").strip():
-            hdr["token"] = VERIFICATION_TOKEN
+            hdr["token"] = verification_token
     payload = _ensure_inbound_message_id(payload)
     return payload
 
 
-def _on_message(data) -> None:
+def _on_message(data, local_webhook: str, verification_token: str) -> None:
     try:
-        payload = _to_webhook_payload(data)
-        r = requests.post(LOCAL_WEBHOOK, json=payload, timeout=300)
-        print(f"[jenkins-ws] forwarded → {LOCAL_WEBHOOK} status={r.status_code}", flush=True)
+        payload = _to_webhook_payload(data, verification_token)
+        r = requests.post(local_webhook, json=payload, timeout=300)
+        print(f"[jenkins-ws] forwarded → {local_webhook} status={r.status_code}", flush=True)
     except Exception as exc:
         print(f"[jenkins-ws] forward failed: {exc!r}", flush=True)
 
 
-def run_forever() -> None:
+def run_forever(local_webhook_url: str | None = None) -> None:
     import lark_oapi as lark
 
-    if not APP_ID or not APP_SECRET:
+    app_id = (os.getenv("APP_ID") or "").strip()
+    app_secret = (os.getenv("APP_SECRET") or "").strip()
+    verification_token = (os.getenv("VERIFICATION_TOKEN") or "").strip()
+    local_webhook = (local_webhook_url or _local_webhook_url()).strip()
+
+    if not app_id or not app_secret:
         print("[jenkins-ws] Set APP_ID and APP_SECRET in .env", file=sys.stderr)
         sys.exit(1)
 
-    if not _wait_for_webhook():
+    if not _wait_for_webhook(local_webhook):
         print(
-            f"[jenkins-ws] Local webhook not ready at {LOCAL_WEBHOOK} — start main.py first",
+            f"[jenkins-ws] Local webhook not ready at {local_webhook} — Flask did not start",
             file=sys.stderr,
         )
         sys.exit(1)
 
+    def _handler(data) -> None:
+        _on_message(data, local_webhook, verification_token)
+
     handler = (
         lark.EventDispatcherHandler.builder("", "")
-        .register_p2_im_message_receive_v1(_on_message)
+        .register_p2_im_message_receive_v1(_handler)
         .build()
     )
     domain_name = (os.getenv("LARK_DOMAIN") or "").strip().lower()
@@ -145,13 +154,21 @@ def run_forever() -> None:
     domain = lark.FEISHU_DOMAIN if domain_name == "feishu" else lark.LARK_DOMAIN
 
     cli = lark.ws.Client(
-        APP_ID,
-        APP_SECRET,
+        app_id,
+        app_secret,
         event_handler=handler,
         log_level=lark.LogLevel.INFO,
         domain=domain,
     )
-    print(f"[jenkins-ws] Persistent connection active → {LOCAL_WEBHOOK}", flush=True)
+    print(
+        f"[jenkins-ws] Persistent connection active (domain={domain_name}) → {local_webhook}",
+        flush=True,
+    )
+    print(
+        "[jenkins-ws] Feishu console → Events → Subscription: "
+        "**Receive events through persistent connection**",
+        flush=True,
+    )
     cli.start()
 
 
