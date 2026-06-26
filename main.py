@@ -453,6 +453,36 @@ def _send_done_notify(
     )
 
 
+def _send_duty_bot_finish_tag(
+    result: str,
+    *,
+    pipeline: str,
+    environment: str,
+    build: int,
+    build_url: str,
+    chat_id: Optional[str] = None,
+    reply_message_id: Optional[str] = None,
+) -> None:
+    """After a Jenkins build finishes, post a message **@-tagging the duty bot** (in the same
+    thread/chat as the done card). Informational only — carries no slash command."""
+    duty = (DUTY_BOT_OPEN_ID or "").strip()
+    if not duty:
+        logger.warning("DUTY_BOT_OPEN_ID missing — skip duty-bot finish tag")
+        return
+    target_chat = (chat_id or "").strip() or NOTIFY_CHAT_ID
+    at = f'<at user_id="{duty}">duty bot</at>'
+    text = (
+        f"{at} Jenkins Finished: {result} | {environment} / {pipeline} #{build}\n{build_url}"
+    )
+    ok = _emit_message(
+        "text", {"text": text}, chat_id=target_chat, reply_message_id=reply_message_id
+    )
+    logger.info(
+        "duty-bot finish tag ok=%s result=%s env=%s pipeline=%s build=%s",
+        ok, result, environment, pipeline, build,
+    )
+
+
 def _send_stuck_card(
     last_snippet: str,
     *,
@@ -1200,6 +1230,16 @@ def _jenkins_watch_worker(
                     chat_id=target_chat,
                     reply_message_id=reply_mid,
                 )
+            # After Jenkins finishes, @-tag the duty bot in the same thread/chat.
+            _send_duty_bot_finish_tag(
+                result,
+                pipeline=ctx["pipeline"],
+                environment=ctx["environment"],
+                build=build,
+                build_url=ctx["build_url"],
+                chat_id=target_chat,
+                reply_message_id=reply_mid,
+            )
             if isinstance(meta, dict) and meta.get("mode") in ("inform", "inform_time"):
                 _notify_duty_after_inform_watch(result, meta, ctx)
             if isinstance(meta, dict) and meta.get("mode") == "vpn_conf":
