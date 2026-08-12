@@ -333,12 +333,18 @@ def _reply_text(message_id: str, text: str) -> bool:
     return True
 
 
-def _send_chat_message(
+def _sent_message_id(data: Dict[str, Any]) -> str:
+    payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+    return str(payload.get("message_id") or "").strip()
+
+
+def _send_chat_message_result(
     chat_id: str, msg_type: str, content_obj: Dict[str, Any]
-) -> bool:
+) -> Tuple[bool, str]:
+    """Send to ``chat_id``; return ``(ok, new_message_id)``."""
     token = _get_tenant_access_token()
     if not token:
-        return False
+        return False, ""
 
     url = f"{_lark_open_base()}/open-apis/im/v1/messages?receive_id_type=chat_id"
     headers = {
@@ -356,24 +362,31 @@ def _send_chat_message(
         data = resp.json()
     except Exception as exc:
         logger.exception("send_chat_message failed: %s", exc)
-        return False
+        return False, ""
     if data.get("code") != 0:
         logger.error("send_chat_message API error: %s", data)
-        return False
-    return True
+        return False, ""
+    return True, _sent_message_id(data)
 
 
-def _reply_in_thread_message(
-    message_id: str, msg_type: str, content_obj: Dict[str, Any]
+def _send_chat_message(
+    chat_id: str, msg_type: str, content_obj: Dict[str, Any]
 ) -> bool:
+    return _send_chat_message_result(chat_id, msg_type, content_obj)[0]
+
+
+def _reply_in_thread_result(
+    message_id: str, msg_type: str, content_obj: Dict[str, Any]
+) -> Tuple[bool, str]:
     """Reply to ``message_id`` **inside its thread** (reply_in_thread=true). Used for VPN so all
-    jenkinsbot output lands under the user's original ``create vpn`` message thread."""
+    jenkinsbot output lands under the user's original ``create vpn`` message thread.
+    Returns ``(ok, new_message_id)``."""
     mid = (message_id or "").strip()
     if not mid:
-        return False
+        return False, ""
     token = _get_tenant_access_token()
     if not token:
-        return False
+        return False, ""
     url = f"{_lark_open_base()}/open-apis/im/v1/messages/{mid}/reply"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -390,9 +403,47 @@ def _reply_in_thread_message(
         data = resp.json()
     except Exception as exc:
         logger.exception("reply_in_thread failed: %s", exc)
-        return False
+        return False, ""
     if data.get("code") != 0:
         logger.error("reply_in_thread API error: %s", data)
+        return False, ""
+    return True, _sent_message_id(data)
+
+
+def _reply_in_thread_message(
+    message_id: str, msg_type: str, content_obj: Dict[str, Any]
+) -> bool:
+    return _reply_in_thread_result(message_id, msg_type, content_obj)[0]
+
+
+def _patch_card_message(message_id: str, card: Dict[str, Any]) -> bool:
+    """Update an already-sent interactive card in place (needs ``config.update_multi``)."""
+    mid = (message_id or "").strip()
+    if not mid:
+        return False
+    token = _get_tenant_access_token()
+    if not token:
+        return False
+    url = f"{_lark_open_base()}/open-apis/im/v1/messages/{mid}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    try:
+        resp = requests.patch(
+            url, headers=headers, json={"content": json.dumps(card)}, timeout=15
+        )
+        data = resp.json() if resp.content else {}
+    except Exception as exc:
+        logger.warning("patch card failed mid=%s err=%s", mid, exc)
+        return False
+    if resp.status_code != 200 or data.get("code") != 0:
+        logger.warning(
+            "patch card API error mid=%s status=%s body=%s",
+            mid,
+            resp.status_code,
+            str(data)[:300],
+        )
         return False
     return True
 
@@ -449,10 +500,25 @@ def _emit_message(
     reply_message_id: Optional[str] = None,
 ) -> bool:
     """Thread-reply under ``reply_message_id`` when given, else plain send to ``chat_id``."""
+    return _emit_message_result(
+        msg_type, content_obj, chat_id=chat_id, reply_message_id=reply_message_id
+    )[0]
+
+
+def _emit_message_result(
+    msg_type: str,
+    content_obj: Dict[str, Any],
+    *,
+    chat_id: str,
+    reply_message_id: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Same as :func:`_emit_message` but also returns the new ``message_id`` (for card patches)."""
     rmid = (reply_message_id or "").strip()
-    if rmid and _reply_in_thread_message(rmid, msg_type, content_obj):
-        return True
-    return _send_chat_message(chat_id, msg_type, content_obj)
+    if rmid:
+        ok, mid = _reply_in_thread_result(rmid, msg_type, content_obj)
+        if ok:
+            return True, mid
+    return _send_chat_message_result(chat_id, msg_type, content_obj)
 
 
 def _jenkins_console_text_url(job_base: str, build: int) -> str:
@@ -1499,15 +1565,32 @@ def internal_vpn_conf_search():
     if not _internal_api_token_ok(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     payload = request.get_json(silent=True) or {}
-    query = str(payload.get("query") or "").strip()
-    if not query:
+    raw_multi = payload.get("queries")
+    if isinstance(raw_multi, list):
+        queries = _split_find_vpn_queries(" ".join(str(q) for q in raw_multi))
+    else:
+        queries = _split_find_vpn_queries(str(payload.get("query") or ""))
+    if not queries:
         return jsonify({"ok": False, "error": "query required"}), 400
     try:
         max_b = int(payload.get("max_builds") or 0)
     except (TypeError, ValueError):
         max_b = 0
-    matches = search_vpn_conf_files(query, max_builds=max_b if max_b > 0 else None)
-    return jsonify({"ok": True, "query": query, "matches": matches, "count": len(matches)})
+    matches, unmatched, err = search_vpn_conf_files_multi(
+        queries, max_builds=max_b if max_b > 0 else None
+    )
+    if err:
+        return jsonify({"ok": False, "error": err, "queries": queries}), 502
+    return jsonify(
+        {
+            "ok": True,
+            "query": queries[0],
+            "queries": queries,
+            "unmatched": unmatched,
+            "matches": matches,
+            "count": len(matches),
+        }
+    )
 
 
 @app.route("/internal/vpn-conf-deliver", methods=["POST"])
@@ -1541,11 +1624,11 @@ def _process_message_command(
     try:
         chat_id = event_chat_id or NOTIFY_CHAT_ID
 
-        find_q = _parse_find_vpn_conf_command(text)
-        if find_q:
+        find_qs = _parse_find_vpn_conf_command(text)
+        if find_qs is not None:
             _handle_find_vpn_conf_lark(
                 chat_id,
-                find_q,
+                find_qs,
                 reply_message_id=(message_id or "").strip(),
                 sender_id=sender_id,
             )
@@ -1773,15 +1856,53 @@ def _internal_api_token_ok(req) -> bool:
     return got == need
 
 
-def _resolve_vpn_creation_auth() -> Optional[Tuple[str, Tuple[str, str]]]:
-    """Working Jenkins REST auth for VPN_CREATION (same host/credentials as create-vpn flow)."""
+def _jenkins_site_label(job_base: str) -> str:
+    """``https://host`` origin — what users see in "is not accessible" replies."""
+    parsed = urlparse(job_base or "")
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return (job_base or "").strip() or "Jenkins"
+
+
+def _resolve_vpn_creation_auth_detail() -> Tuple[Optional[Tuple[str, Tuple[str, str]]], str]:
+    """Working VPN_CREATION auth plus a user-facing error when there is none.
+
+    Separates *site unreachable* (DNS/TCP/TLS/timeout — ``_jenkins_rest_get`` reports status 0)
+    from *site reachable but rejected us* (HTTP 401/403/404), so the chat reply can name which.
+    """
     job_base = VPN_CREATION_JOB_FOLDER_URL.rstrip("/") + "/"
     job_api = f"{job_base.rstrip('/')}/api/json?tree=lastBuild[number]"
-    for auth in _auth_candidates_for(job_base):
-        ok, _status, data, _hint = _jenkins_rest_get(job_api, auth)
+    site = _jenkins_site_label(job_base)
+    candidates = [(u, p) for u, p in _auth_candidates_for(job_base) if u and p]
+    if not candidates:
+        return None, (
+            f"❌ No Jenkins credentials for `{site}` — set `createvpnid` / `createvpnpass` in `.env`."
+        )
+
+    unreachable = ""
+    http_status = 0
+    http_hint = ""
+    for auth in candidates:
+        ok, status, data, hint = _jenkins_rest_get(job_api, auth)
         if ok and isinstance(data, dict):
-            return job_base, auth
-    return None
+            return (job_base, auth), ""
+        if status == 0:
+            unreachable = unreachable or (hint or "connection failed")
+        else:
+            http_status = status
+            http_hint = hint
+
+    if unreachable and not http_status:
+        return None, f"❌ `{site}` is not accessible — {unreachable}"
+    return None, (
+        f"❌ `{site}` rejected the request (HTTP {http_status})"
+        + (f" — {http_hint}" if http_hint else "")
+    )
+
+
+def _resolve_vpn_creation_auth() -> Optional[Tuple[str, Tuple[str, str]]]:
+    """Working Jenkins REST auth for VPN_CREATION (same host/credentials as create-vpn flow)."""
+    return _resolve_vpn_creation_auth_detail()[0]
 
 
 def _vpn_find_max_builds() -> int:
@@ -1818,28 +1939,53 @@ def _list_success_build_numbers(
     return out
 
 
-def search_vpn_conf_files(query: str, *, max_builds: int | None = None) -> List[Dict[str, Any]]:
+def search_vpn_conf_files_multi(
+    queries: List[str], *, max_builds: int | None = None
+) -> Tuple[List[Dict[str, Any]], List[str], str]:
     """
     Search recent VPN_CREATION SUCCESS builds for ``.conf`` artifacts whose **filename stem**
-    contains ``query`` (case-insensitive). Returns newest build per distinct filename.
+    contains **any** of ``queries`` (case-insensitive). Newest build wins per distinct filename.
+
+    Returns ``(rows, unmatched_queries, error)``. ``error`` is a ready-to-send chat string when
+    the Jenkins site is unreachable or rejects us — ``rows`` is empty in that case, so callers
+    can tell "site down" apart from "searched fine, found nothing". Each row gains ``matched``:
+    the queries that hit that filename.
     """
-    q = (query or "").strip()
-    if len(q) < 1:
-        return []
-    qcf = q.casefold()
+    qs: List[str] = []
+    seen: set = set()
+    for raw in queries or []:
+        q = str(raw or "").strip()
+        if not q or q.casefold() in seen:
+            continue
+        seen.add(q.casefold())
+        qs.append(q)
+    if not qs:
+        return [], [], ""
+
+    pairs = [(q, q.casefold()) for q in qs]
     cap = max_builds if max_builds is not None else _vpn_find_max_builds()
-    resolved = _resolve_vpn_creation_auth()
+    resolved, err = _resolve_vpn_creation_auth_detail()
     if not resolved:
-        return []
+        return [], qs, err
     job_base, auth = resolved
+    builds = _list_success_build_numbers(job_base, auth, limit=cap)
+    if not builds:
+        site = _jenkins_site_label(job_base)
+        return [], qs, (
+            f"❌ `{site}` is not accessible — could not list VPN_CREATION builds."
+        )
+
     best: Dict[str, Dict[str, Any]] = {}
-    for build in _list_success_build_numbers(job_base, auth, limit=cap):
+    hit: set = set()
+    for build in builds:
         for fn, rel in _list_build_artifacts(job_base, build, auth):
             if not fn.casefold().endswith(".conf"):
                 continue
-            stem = fn[:-5].casefold() if fn.lower().endswith(".conf") else fn.casefold()
-            if qcf not in stem:
+            stem = fn[:-5].casefold()
+            matched = [q for q, qcf in pairs if qcf in stem]
+            if not matched:
                 continue
+            hit.update(q.casefold() for q in matched)
             prev = best.get(fn)
             if prev is None or build > int(prev.get("build") or 0):
                 artifact_url = f"{job_base.rstrip('/')}/{build}/artifact/{rel}"
@@ -1849,8 +1995,16 @@ def search_vpn_conf_files(query: str, *, max_builds: int | None = None) -> List[
                     "build": build,
                     "job_base": job_base,
                     "artifact_url": artifact_url,
+                    "matched": matched,
                 }
     rows = sorted(best.values(), key=lambda r: (r["file"].casefold(), -int(r["build"])))
+    unmatched = [q for q, qcf in pairs if qcf not in hit]
+    return rows, unmatched, ""
+
+
+def search_vpn_conf_files(query: str, *, max_builds: int | None = None) -> List[Dict[str, Any]]:
+    """Single-query form of :func:`search_vpn_conf_files_multi` (kept for existing callers)."""
+    rows, _unmatched, _err = search_vpn_conf_files_multi([query], max_builds=max_builds)
     return rows
 
 
@@ -1948,41 +2102,83 @@ def _vpn_find_button_row(buttons: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _vpn_find_pick_card(matches: List[Dict[str, Any]], query: str, *, picker_sid: str) -> Dict[str, Any]:
-    cap = min(10, len(matches))
+def _vpn_find_pick_card(
+    matches: List[Dict[str, Any]],
+    queries: Any,
+    *,
+    picker_sid: str,
+    sent: Optional[List[int]] = None,
+    unmatched: Optional[List[str]] = None,
+    total: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Picker card listing every match as its own button. Buttons stay live so the user can tap
+    several; already-sent ones are re-rendered with ✅ when the card is patched."""
+    qs = [queries] if isinstance(queries, str) else [str(q) for q in (queries or [])]
+    done = {int(i) for i in (sent or [])}
+    cap = len(matches)
     buttons: List[Dict[str, Any]] = []
     for i in range(cap):
-        row = matches[i]
-        fn = str(row.get("file") or "?")
-        label = f"{i + 1}. {fn}"[:60]
+        fn = str(matches[i].get("file") or "?")
+        picked = (i + 1) in done
+        prefix = "✅" if picked else f"{i + 1}."
         buttons.append(
             _vpn_find_callback_button(
-                label,
-                "primary" if i == 0 else "default",
+                f"{prefix} {fn}"[:60],
+                "default" if (picked or i) else "primary",
                 {"k": "vpn_find", "i": i + 1, "sid": picker_sid},
                 element_id=f"vpnf{i}"[:20],
             )
         )
+
+    shown = ", ".join(f"**`{q}`**" for q in qs) or "your search"
+    head = f"🔍 **{cap}** VPN `.conf` files match {shown}"
+    if total and int(total) > cap:
+        head += f" (showing newest {cap} of {int(total)})"
+    head += " — tap a file to download; you can tap more than one:"
+
     body_elements: List[Dict[str, Any]] = [
-        {
-            "tag": "div",
-            "text": {
-                "tag": "lark_md",
-                "content": (
-                    f"🔍 **{cap}** VPN `.conf` files match **`{query}`** — tap one to download:"
-                ),
-            },
-        }
+        {"tag": "div", "text": {"tag": "lark_md", "content": head}}
     ]
     for off in range(0, len(buttons), 3):
         body_elements.append(_vpn_find_button_row(buttons[off : off + 3]))
+    if unmatched:
+        body_elements.append(
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": "⚠️ No `.conf` found for: "
+                    + ", ".join(f"`{q}`" for q in unmatched),
+                },
+            }
+        )
+    if done:
+        body_elements.append(
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"✅ Sent **{len(done)}** of **{cap}**.",
+                },
+            }
+        )
     body_elements.append({"tag": "hr"})
     body_elements.append(
-        _vpn_find_callback_button(
-            "Cancel",
-            "default",
-            {"k": "vpn_find_cancel", "sid": picker_sid},
-            element_id="vpn_find_can",
+        _vpn_find_button_row(
+            [
+                _vpn_find_callback_button(
+                    "Done",
+                    "primary" if done else "default",
+                    {"k": "vpn_find_done", "sid": picker_sid},
+                    element_id="vpn_find_done",
+                ),
+                _vpn_find_callback_button(
+                    "Cancel",
+                    "default",
+                    {"k": "vpn_find_cancel", "sid": picker_sid},
+                    element_id="vpn_find_can",
+                ),
+            ]
         )
     )
     return {
@@ -1990,6 +2186,36 @@ def _vpn_find_pick_card(matches: List[Dict[str, Any]], query: str, *, picker_sid
         "config": {"update_multi": True, "width_mode": "fill"},
         "body": {"elements": body_elements},
     }
+
+
+def _vpn_find_max_buttons() -> int:
+    try:
+        return max(1, min(40, int(os.getenv("VPN_FIND_MAX_BUTTONS", "20"))))
+    except ValueError:
+        return 20
+
+
+def _vpn_find_session_ttl() -> int:
+    try:
+        return max(60, min(86400, int(os.getenv("VPN_FIND_SESSION_TTL_SEC", "1800"))))
+    except ValueError:
+        return 1800
+
+
+def _vpn_find_prune_locked() -> None:
+    """Drop timed-out picker sessions and orphaned sids. Caller holds the sessions lock.
+
+    Needed because a picker now survives past the first pick (multi-select), so nothing else
+    would ever remove a session the user neither finishes nor cancels."""
+    ttl = _vpn_find_session_ttl()
+    now = time.time()
+    for key, sess in list(_vpn_find_sessions.items()):
+        created = float((sess or {}).get("created_at") or 0)
+        if created and now - created > ttl:
+            _vpn_find_sessions.pop(key, None)
+    for psid, key in list(_vpn_find_picker_sids.items()):
+        if key not in _vpn_find_sessions:
+            _vpn_find_picker_sids.pop(psid, None)
 
 
 def _vpn_find_register_picker(picker_sid: str, session_key: str) -> None:
@@ -2088,25 +2314,30 @@ def _process_card_action_payload(payload: Dict[str, Any]) -> None:
         sid = str(value.get("sid") or "").strip()
 
         session_key = ""
-        if sid:
-            with _vpn_find_sessions_lock:
-                session_key = (_vpn_find_picker_sids.get(sid) or "").strip()
-        if not session_key:
-            session_key = _vpn_find_session_key(chat_id, sender_id)
-
         with _vpn_find_sessions_lock:
+            _vpn_find_prune_locked()
+            if sid:
+                session_key = (_vpn_find_picker_sids.get(sid) or "").strip()
+            if not session_key:
+                session_key = _vpn_find_session_key(chat_id, sender_id)
             sess = _vpn_find_sessions.get(session_key)
         thread_root = _vpn_find_thread_root(sess)
 
-        if k == "vpn_find_cancel":
+        if k in ("vpn_find_cancel", "vpn_find_done"):
             with _vpn_find_sessions_lock:
-                _vpn_find_sessions.pop(session_key, None)
+                closed = _vpn_find_sessions.pop(session_key, None)
                 if sid:
                     _vpn_find_picker_sids.pop(sid, None)
+            thread_root = _vpn_find_thread_root(closed) or thread_root
+            n_sent = len(list((closed or {}).get("sent") or []))
+            if k == "vpn_find_done":
+                note = f"✅ VPN file search closed — {n_sent} file(s) sent."
+            else:
+                note = "VPN file search cancelled."
             if thread_root:
                 _emit_message(
                     "text",
-                    {"text": "VPN file search cancelled."},
+                    {"text": note},
                     chat_id=chat_id,
                     reply_message_id=thread_root,
                 )
@@ -2120,7 +2351,43 @@ def _process_card_action_payload(payload: Dict[str, Any]) -> None:
         except (TypeError, ValueError):
             return
 
-        if not isinstance(sess, dict) or sess.get("state") != "vpn_find_pick":
+        # Claim the pick under the lock so a double-tap (Lark can deliver the same action twice,
+        # and each action runs on its own thread) cannot download and send the same file twice.
+        state = ""
+        row: Optional[Dict[str, Any]] = None
+        dup_file = ""
+        card_mid = ""
+        card: Optional[Dict[str, Any]] = None
+        with _vpn_find_sessions_lock:
+            sess = _vpn_find_sessions.get(session_key)
+            stale_sid = bool(sid) and str((sess or {}).get("picker_sid") or "") != sid
+            if not isinstance(sess, dict) or sess.get("state") != "vpn_find_pick" or stale_sid:
+                state = "expired"
+            else:
+                thread_root = _vpn_find_thread_root(sess) or thread_root
+                candidates = list(sess.get("candidates") or [])
+                sent = [int(x) for x in (sess.get("sent") or [])]
+                if idx < 1 or idx > len(candidates):
+                    state = "invalid"
+                elif idx in sent:
+                    state = "duplicate"
+                    dup_file = str(candidates[idx - 1].get("file") or "?")
+                else:
+                    sent.append(idx)
+                    sess["sent"] = sent
+                    row = candidates[idx - 1]
+                    state = "ok"
+                    card_mid = str(sess.get("card_message_id") or "").strip()
+                    card = _vpn_find_pick_card(
+                        candidates,
+                        list(sess.get("queries") or []),
+                        picker_sid=str(sess.get("picker_sid") or ""),
+                        sent=list(sent),
+                        unmatched=list(sess.get("unmatched") or []),
+                        total=int(sess.get("total") or len(candidates)),
+                    )
+
+        if state == "expired":
             if thread_root:
                 _emit_message(
                     "text",
@@ -2129,9 +2396,7 @@ def _process_card_action_payload(payload: Dict[str, Any]) -> None:
                     reply_message_id=thread_root,
                 )
             return
-
-        candidates = list(sess.get("candidates") or [])
-        if idx < 1 or idx > len(candidates):
+        if state == "invalid":
             if thread_root:
                 _emit_message(
                     "text",
@@ -2140,95 +2405,174 @@ def _process_card_action_payload(payload: Dict[str, Any]) -> None:
                     reply_message_id=thread_root,
                 )
             return
+        if state == "duplicate":
+            if thread_root:
+                _emit_message(
+                    "text",
+                    {"text": f"ℹ️ `{dup_file}` was already sent — pick another or **Done**."},
+                    chat_id=chat_id,
+                    reply_message_id=thread_root,
+                )
+            return
+        if not row:
+            return
 
-        row = candidates[idx - 1]
-        thread_root = _vpn_find_thread_root(sess) or thread_root
-        with _vpn_find_sessions_lock:
-            _vpn_find_sessions.pop(session_key, None)
-            if sid:
-                _vpn_find_picker_sids.pop(sid, None)
+        # Tick the button before the (slow) download+upload so the user sees the tap landed.
+        if card_mid and card:
+            _patch_card_message(card_mid, card)
         _vpn_find_deliver_row(chat_id, row, thread_root)
     except Exception as exc:
         logger.exception("card.action failed: %s", exc)
 
 
-def _parse_find_vpn_conf_command(text: str) -> Optional[str]:
-    """``/FindVpnConf alex`` or ``find vpn conf alex`` → username query."""
+_FIND_VPN_MAX_QUERIES = 10
+
+# Split on comma / full-width comma / ideographic comma / semicolon / slash / pipe / whitespace,
+# so ``alex,bob``, ``{alex}, {bob}``, ``alex；bob`` and ``alex bob`` all mean the same thing.
+_FIND_VPN_SPLIT_RE = re.compile(r"[,，、;；/|\s]+")
+
+# Words that are part of the command phrasing, never a username.
+_FIND_VPN_STOPWORDS = frozenset(
+    {"vpn", "conf", "confs", "config", "configs", "file", "files", "for", "and", "the"}
+)
+
+
+def _split_find_vpn_queries(raw: str) -> List[str]:
+    """``alex, bob`` / ``{alex},{bob}`` / ``alex bob`` → ``["alex", "bob"]`` (order kept, deduped)."""
+    out: List[str] = []
+    seen: set = set()
+    for part in _FIND_VPN_SPLIT_RE.split(raw or ""):
+        tok = part.strip().strip("{}[]()<>\"'`").strip(":,.").strip()
+        if not tok:
+            continue
+        key = tok.casefold()
+        if key in _FIND_VPN_STOPWORDS or key in seen:
+            continue
+        seen.add(key)
+        out.append(tok)
+        if len(out) >= _FIND_VPN_MAX_QUERIES:
+            break
+    return out
+
+
+def _parse_find_vpn_conf_command(text: str) -> Optional[List[str]]:
+    """``/FindVpnConf alex,bob`` or ``find vpn file alex, bob`` → ``["alex", "bob"]``.
+
+    ``None`` means "not this command"; ``[]`` means the command was used with no usable name,
+    which the handler answers with usage text instead of searching for a stray word.
+    """
     raw = _strip_lark_mentions((text or "").strip())
     if not re.search(r"(?i)/FindVpnConf\b|find\s+vpn\s+(?:conf|file)", raw):
         return None
-    m = re.search(r"(?i)/FindVpnConf\s+(\S+)", raw)
+    m = re.search(r"(?i)/FindVpnConf\s+(.+)$", raw)
     if m:
-        return m.group(1).strip().strip(":,")
+        return _split_find_vpn_queries(m.group(1))
     m2 = re.search(
-        r"(?i)(?:find|search)\s+(?:vpn\s+)?(?:conf(?:ig)?\s+)?(?:file\s+)?(?:for\s+)?(\S+)\s*$",
+        r"(?i)(?:find|search)\s+(?:vpn\s+)?(?:conf(?:ig)?s?\s+)?(?:files?\s+)?(?:for\s+)?(.+?)\s*$",
         raw,
     )
     if m2:
-        return m2.group(1).strip().strip(":,")
-    return None
+        return _split_find_vpn_queries(m2.group(1))
+    return []
 
 
 def _handle_find_vpn_conf_lark(
     chat_id: str,
-    query: str,
+    queries: Any,
     reply_message_id: Optional[str] = None,
     sender_id: str = "",
 ) -> None:
-    """Lark entry when user @ jenkinsbot with ``find vpn file <query>``."""
-    q = (query or "").strip()
+    """Lark entry when user @ jenkinsbot with ``find vpn file <name>[,<name>…]``."""
+    if isinstance(queries, str):
+        qs = _split_find_vpn_queries(queries)
+    else:
+        qs = _split_find_vpn_queries(" ".join(str(q) for q in (queries or [])))
     thread_root = (reply_message_id or "").strip()
-    if not q:
+    if not qs:
         _emit_message(
             "text",
-            {"text": "Usage: `find vpn file <name>` — e.g. `find vpn file alex`"},
+            {
+                "text": (
+                    "Usage: `find vpn file <name>[,<name>…]` — "
+                    "e.g. `find vpn file alex` or `find vpn file alex,bob`"
+                )
+            },
             chat_id=chat_id,
             reply_message_id=thread_root or None,
         )
         return
 
+    shown = ", ".join(f"`{q}`" for q in qs)
     if thread_root:
         _add_message_reaction(thread_root, "OK")
     _emit_message(
         "text",
-        {"text": f"🔍 Finding VPN files matching `{q}` — kindly wait…"},
+        {"text": f"🔍 Finding VPN files matching {shown} — kindly wait…"},
         chat_id=chat_id,
         reply_message_id=thread_root or None,
     )
 
-    matches = search_vpn_conf_files(q)
-    if not matches:
+    matches, unmatched, err = search_vpn_conf_files_multi(qs)
+    if err:
         _emit_message(
             "text",
-            {"text": f"❌ No VPN `.conf` found matching `{q}` in recent VPN_CREATION builds."},
+            {"text": err},
             chat_id=chat_id,
             reply_message_id=thread_root or None,
         )
         return
-    if len(matches) == 1:
+    if not matches:
+        _emit_message(
+            "text",
+            {"text": f"❌ No VPN `.conf` found matching {shown} in recent VPN_CREATION builds."},
+            chat_id=chat_id,
+            reply_message_id=thread_root or None,
+        )
+        return
+    # Single name with a single hit stays a one-shot send — no card to tap for the common case.
+    if len(qs) == 1 and len(matches) == 1:
         _vpn_find_deliver_row(chat_id, matches[0], thread_root)
         return
 
-    cap = min(10, len(matches))
+    cap = min(_vpn_find_max_buttons(), len(matches))
     picker_sid = secrets.token_hex(16)
     key = _vpn_find_session_key(chat_id, sender_id)
     with _vpn_find_sessions_lock:
+        _vpn_find_prune_locked()
         _vpn_find_sessions[key] = {
             "state": "vpn_find_pick",
             "candidates": matches[:cap],
-            "query": q,
+            "queries": qs,
+            "unmatched": unmatched,
+            "sent": [],
+            "total": len(matches),
             "thread_root_id": thread_root,
             "picker_sid": picker_sid,
+            "card_message_id": "",
+            "created_at": time.time(),
         }
     _vpn_find_register_picker(picker_sid, key)
 
-    card = _vpn_find_pick_card(matches[:cap], q, picker_sid=picker_sid)
-    _emit_message(
+    card = _vpn_find_pick_card(
+        matches[:cap],
+        qs,
+        picker_sid=picker_sid,
+        sent=[],
+        unmatched=unmatched,
+        total=len(matches),
+    )
+    _ok, card_mid = _emit_message_result(
         "interactive",
         card,
         chat_id=chat_id,
         reply_message_id=thread_root or None,
     )
+    # Needed so each tap can patch ✅ back onto the card it came from.
+    if card_mid:
+        with _vpn_find_sessions_lock:
+            sess = _vpn_find_sessions.get(key)
+            if isinstance(sess, dict) and sess.get("picker_sid") == picker_sid:
+                sess["card_message_id"] = card_mid
 
 
 def _parse_testaccess_build_arg(argv: List[str]) -> Optional[int]:
