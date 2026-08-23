@@ -958,21 +958,29 @@ def _format_local_time_pm() -> str:
     return f"{hour}:{now.minute:02d}{ampm}"
 
 
-def _send_duty_text(text: str) -> bool:
+def _send_duty_text(text: str, chat_id: Optional[str] = None) -> bool:
+    """Post a duty-bot command into ``chat_id`` (the chat the build was informed from).
+
+    The duty bot resolves a ``/updatemore`` queue **by chat id**, so this must land in the chat
+    that started the update, not in ``NOTIFY_CHAT_ID``. Sending it to the duty chat instead left
+    the real chat's queue parked at ``waiting_jenkins`` and put the "no active queue" warning in
+    front of the wrong people.
+    """
     plain = (text or "").strip()
     if not plain:
         logger.warning("empty duty notify text — skip")
         return False
+    target_chat = (chat_id or "").strip() or NOTIFY_CHAT_ID
     if TAG_USER_OPEN_ID:
         at = _tag_user_at_text()
-        if _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": f"{at} {plain}".strip()}):
-            logger.info("duty notify sent (@tag): %r", plain[:120])
+        if _send_chat_message(target_chat, "text", {"text": f"{at} {plain}".strip()}):
+            logger.info("duty notify sent (@tag) chat=%s: %r", target_chat, plain[:120])
             return True
         logger.warning("duty @tag send failed — retrying plain")
     else:
         logger.warning("TAG_USER_OPEN_ID missing — sending duty command without @tag")
-    if _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": plain}):
-        logger.info("duty notify sent (plain): %r", plain[:120])
+    if _send_chat_message(target_chat, "text", {"text": plain}):
+        logger.info("duty notify sent (plain) chat=%s: %r", target_chat, plain[:120])
         return True
     return False
 
@@ -1021,8 +1029,13 @@ def _duty_updatemore_callback_url() -> str:
     return f"http://{host}:{port}/internal/updatemore-jenkins-callback"
 
 
-def _notify_duty_updatemore_callback_http(command: str) -> bool:
-    """POST to duty bot — reliable when Lark skips bot→bot group delivery."""
+def _notify_duty_updatemore_callback_http(command: str, chat_id: Optional[str] = None) -> bool:
+    """POST to duty bot — reliable when Lark skips bot→bot group delivery.
+
+    ``chat_id`` must be the chat the build was informed from: the duty bot looks its
+    ``/updatemore`` queue up by chat id, so a hard-coded ``NOTIFY_CHAT_ID`` made every run
+    started in any other chat unresolvable there.
+    """
     cmd = (command or "").strip()
     if not cmd:
         return False
@@ -1031,7 +1044,7 @@ def _notify_duty_updatemore_callback_http(command: str) -> bool:
     headers: Dict[str, str] = {"Content-Type": "application/json"}
     if token:
         headers["X-Duty-Internal-Token"] = token
-    payload = {"chat_id": NOTIFY_CHAT_ID, "command": cmd}
+    payload = {"chat_id": (chat_id or "").strip() or NOTIFY_CHAT_ID, "command": cmd}
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=90)
         if resp.status_code in (200, 202):
@@ -1054,16 +1067,21 @@ def _notify_duty_updatemore_callback_http(command: str) -> bool:
 
 
 def _notify_duty_reply_update_email_http(
-    title: str, pipeline: str, when: str
+    title: str, pipeline: str, when: str, chat_id: Optional[str] = None
 ) -> bool:
-    """POST to duty bot — reliable when Lark skips bot→bot group delivery."""
+    """POST to duty bot — reliable when Lark skips bot→bot group delivery.
+
+    See :func:`_notify_duty_updatemore_callback_http` for why ``chat_id`` must be the informing
+    chat. For this endpoint the stakes are higher: with the wrong chat the duty bot cannot find
+    the e-mail batch and the customer reply is never sent.
+    """
     url = _duty_reply_update_url()
     token = (os.getenv("DUTY_INTERNAL_TOKEN") or "").strip()
     headers: Dict[str, str] = {"Content-Type": "application/json"}
     if token:
         headers["X-Duty-Internal-Token"] = token
     payload = {
-        "chat_id": NOTIFY_CHAT_ID,
+        "chat_id": (chat_id or "").strip() or NOTIFY_CHAT_ID,
         "email_title": (title or "").strip(),
         "environment": (pipeline or "").strip(),
         "when": (when or "").strip(),
@@ -1100,21 +1118,24 @@ def _notify_duty_after_inform_watch(
     meta: Dict[str, Any],
     ctx: Dict[str, str],
 ) -> None:
+    # The chat the update was started in — NOT NOTIFY_CHAT_ID. The duty bot indexes its
+    # /updatemore queue by chat id, so every channel below has to target this one.
+    duty_chat = str((meta or {}).get("chat_id") or "").strip() or NOTIFY_CHAT_ID
     if result != "SUCCESS":
-        if _notify_duty_updatemore_callback_http("/FailedStop"):
-            logger.info("duty bot notified via HTTP for /FailedStop")
+        if _notify_duty_updatemore_callback_http("/FailedStop", duty_chat):
+            logger.info("duty bot notified via HTTP for /FailedStop chat=%s", duty_chat)
             return
-        _send_duty_text("/FailedStop")
+        _send_duty_text("/FailedStop", duty_chat)
         return
     if meta.get("mode") == "inform_time":
         title = (meta.get("email_title") or "").strip()
         pipeline = (ctx.get("pipeline") or "").strip()
         when = _format_local_time_pm()
         cmd = f"/replyupdateemail | {title} | {pipeline} | {when}".strip()
-        if _notify_duty_reply_update_email_http(title, pipeline, when):
+        if _notify_duty_reply_update_email_http(title, pipeline, when, duty_chat):
             logger.info("duty bot notified via HTTP for email=%r", title)
             return
-        if _send_duty_text(cmd):
+        if _send_duty_text(cmd, duty_chat):
             logger.info("duty bot notified via Lark for email=%r", title)
             return
         warn = (
@@ -1122,14 +1143,14 @@ def _notify_duty_after_inform_watch(
             f"Run manually: `{cmd}`"
         )
         logger.error("duty notify failed — %s", cmd)
-        _send_chat_message(NOTIFY_CHAT_ID, "text", {"text": warn})
+        _send_chat_message(duty_chat, "text", {"text": warn})
     elif meta.get("mode") == "inform":
-        if _notify_duty_updatemore_callback_http("/SuccessProceedNext"):
-            logger.info("duty bot notified via HTTP for /SuccessProceedNext")
+        if _notify_duty_updatemore_callback_http("/SuccessProceedNext", duty_chat):
+            logger.info("duty bot notified via HTTP for /SuccessProceedNext chat=%s", duty_chat)
             return
-        if not _send_duty_text("/SuccessProceedNext"):
+        if not _send_duty_text("/SuccessProceedNext", duty_chat):
             _send_chat_message(
-                NOTIFY_CHAT_ID,
+                duty_chat,
                 "text",
                 {"text": "⚠️ Could not reach duty bot for `/SuccessProceedNext`"},
             )
