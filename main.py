@@ -2749,6 +2749,14 @@ def _handle_ws_im_message(data) -> None:
         return
 
     logger.info("ws im.message message_id=%s text=%r", message_id, text[:300])
+    # Same dedupe the HTTP route does. This path had none, and persistent connection is the
+    # default mode — so a redelivery after a websocket reconnect started a SECOND watch worker on
+    # the same build, which then sent a second /SuccessProceedNext to the duty bot and advanced
+    # its queue past a segment that had not built yet.
+    event_key = (raw.get("header") or {}).get("event_id") or raw.get("uuid") or message_id
+    if _event_seen_already(str(event_key)):
+        logger.info("ws duplicate event skipped key=%s message_id=%s", event_key, message_id)
+        return
     threading.Thread(
         target=_process_message_command,
         args=(text, message_id, event_chat_id, _event_sender_open_id(event)),
@@ -2770,11 +2778,21 @@ def _handle_ws_card_action(data) -> None:
     if "header" in raw and "event" in raw:
         payload = dict(raw)
     else:
+        # Carry the event id through instead of dropping it — without it the dedupe below can
+        # never fire, and a redelivered card frame runs the handler twice.
+        _hdr = {"event_type": "card.action.trigger"}
+        _eid = (raw.get("header") or {}).get("event_id") or raw.get("uuid") or ""
+        if _eid:
+            _hdr["event_id"] = str(_eid)
         payload = {
             "schema": "2.0",
-            "header": {"event_type": "card.action.trigger"},
+            "header": _hdr,
             "event": raw.get("event", raw),
         }
+    event_key = (payload.get("header") or {}).get("event_id") or payload.get("uuid") or ""
+    if event_key and _event_seen_already(str(event_key)):
+        logger.info("ws duplicate card action skipped key=%s", event_key)
+        return
     threading.Thread(
         target=_process_card_action_payload,
         args=(payload,),
