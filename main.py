@@ -630,10 +630,14 @@ def _log_panel_expanded() -> bool:
 
 
 def _log_gzip_enabled() -> bool:
-    """A console over Lark's per-upload ceiling is gzipped into ONE file by default. Set
-    ``JENKINS_LOG_GZIP=0`` to get plain ``.partNofM.log`` files instead — more of them, but
-    each opens in one click with no unzip step. Either way nothing is omitted."""
-    return _env_flag("JENKINS_LOG_GZIP", "1")
+    """Plain ``.log`` by default — a ``.gz`` has to be unpacked before you can read anything.
+
+    Lark refuses any single upload over 30 MB, so a console bigger than that cannot be one
+    plain ``.log`` no matter what: it arrives as ``{pipeline}.partNofM.log``, each part opening
+    directly. Set ``JENKINS_LOG_GZIP=1`` to trade that for ONE small ``{pipeline}.log.gz``
+    instead (~190 MB compresses to well under a megabyte, so it is far quicker to upload and to
+    download). Neither setting omits a byte."""
+    return _env_flag("JENKINS_LOG_GZIP", "0")
 
 
 def _log_panel_code_block() -> bool:

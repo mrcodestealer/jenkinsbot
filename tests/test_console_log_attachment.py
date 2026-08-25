@@ -406,6 +406,7 @@ def test_a_console_too_big_to_upload_is_gzipped_not_truncated() -> None:
     raw = log.encode("utf-8")
     saved = os.environ.get("JENKINS_LOG_FILE_MAX_BYTES")
     os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = "1048576"  # 1 MB, so 7 MB must compress
+    os.environ["JENKINS_LOG_GZIP"] = "1"  # opt in: plain .log is the default
     try:
         with Capture() as cap:
             ok = jb._send_console_log_file(log, file_name="FPMS_PROD_SCRIPT_RUN.log",
@@ -425,6 +426,7 @@ def test_a_console_too_big_to_upload_is_gzipped_not_truncated() -> None:
             "NO omission marker survives anywhere in the delivered log",
         )
     finally:
+        os.environ.pop("JENKINS_LOG_GZIP", None)
         if saved is None:
             os.environ.pop("JENKINS_LOG_FILE_MAX_BYTES", None)
         else:
@@ -440,6 +442,7 @@ def test_a_console_that_will_not_compress_is_split_not_truncated() -> None:
     raw = log.encode("utf-8")
     saved = os.environ.get("JENKINS_LOG_FILE_MAX_BYTES")
     os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = "4096"
+    os.environ["JENKINS_LOG_GZIP"] = "1"  # opt in: plain .log is the default
     try:
         with Capture() as cap:
             ok = jb._send_console_log_file(log, file_name="big.log", chat_id=CHAT)
@@ -459,6 +462,7 @@ def test_a_console_that_will_not_compress_is_split_not_truncated() -> None:
             f"one file message per part (sent {len(cap.sent)}, parts {len(cap.uploads)})",
         )
     finally:
+        os.environ.pop("JENKINS_LOG_GZIP", None)
         if saved is None:
             os.environ.pop("JENKINS_LOG_FILE_MAX_BYTES", None)
         else:
@@ -506,27 +510,70 @@ def test_the_card_names_the_file_that_actually_arrives() -> None:
             os.environ[key] = val
 
 
-def test_gzip_can_be_traded_for_plain_clickable_parts() -> None:
-    """A .gz has to be unzipped before you can read it. JENKINS_LOG_GZIP=0 delivers plain .log
-    parts instead — more files, but each opens in one click. Neither loses a byte."""
+def test_the_delivered_file_is_a_plain_log_by_default() -> None:
+    """A .gz has to be unpacked before you can read a line of it, so plain .log is the default.
+    Lark refuses any single upload over 30 MB, so a console past that becomes
+    {pipeline}.partNofM.log — still plain, still one click each — never one .log.gz."""
+    check(jb._log_gzip_enabled() is False, "gzip is OFF unless explicitly asked for")
+
+    with Capture() as cap:
+        jb._send_console_log_file(SMALL_LOG, file_name="FPMS_PROD_SCRIPT_RUN.log", chat_id=CHAT)
+    check(
+        [n for n, _s, _b in cap.uploads] == ["FPMS_PROD_SCRIPT_RUN.log"],
+        f"an ordinary build is exactly {{pipeline}}.log (got {[u[0] for u in cap.uploads]!r})",
+    )
+
+    log = "".join(f"[{i:08d}] a line of jenkins output\n" for i in range(80000))
+    os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = "1048576"
+    try:
+        names = [
+            n
+            for n, _b in jb._console_log_payloads(
+                log, base_name="FPMS_PROD_SCRIPT_RUN.log", cap=jb._log_file_max_bytes()
+            )
+        ]
+        check(
+            not any(n.endswith(".gz") for n in names),
+            f"nothing is gzipped by default (got {names[:2]!r})",
+        )
+        check(
+            len(names) > 1 and all(n.endswith(".log") for n in names),
+            f"it is plain numbered .log parts (got {names[:2]!r}, {len(names)} parts)",
+        )
+        shown = jb._console_log_display_name(
+            len(log.encode("utf-8")),
+            "FPMS_PROD_SCRIPT_RUN.log",
+            jb._log_file_max_bytes(),
+        )
+        check(
+            shown == f"FPMS_PROD_SCRIPT_RUN.partNof{len(names)}.log",
+            f"the card names them honestly (got {shown!r} for {len(names)} parts)",
+        )
+    finally:
+        os.environ.pop("JENKINS_LOG_FILE_MAX_BYTES", None)
+
+
+def test_gzip_can_be_traded_for_one_small_archive() -> None:
+    """The opt-in direction: JENKINS_LOG_GZIP=1 swaps N big plain uploads for one tiny .log.gz.
+    Pinned so both directions keep working, and neither loses a byte."""
     log = "".join(f"[{i:08d}] a line of jenkins output\n" for i in range(80000))
     raw = log.encode("utf-8")
     saved = os.environ.get("JENKINS_LOG_GZIP")
-    os.environ["JENKINS_LOG_GZIP"] = "0"
+    os.environ["JENKINS_LOG_GZIP"] = "1"
     os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = "1048576"
     try:
         with Capture() as cap:
             ok = jb._send_console_log_file(log, file_name="P.log", chat_id=CHAT)
-        check(ok is True, "the plain-parts delivery succeeds")
+        check(ok is True, "the opt-in gzip delivery succeeds")
         check(
-            cap.uploads and all(n.endswith(".log") for n, _s, _b in cap.uploads),
-            f"every part is a plain .log (got {[u[0] for u in cap.uploads][:3]!r})",
+            [n for n, _s, _b in cap.uploads] == ["P.log.gz"],
+            f"one .log.gz replaces the plain parts (got {[u[0] for u in cap.uploads]!r})",
         )
         check(
-            all(size <= 1048576 for _n, size, _b in cap.uploads),
-            "no plain part exceeds the per-upload ceiling",
+            bool(cap.uploads) and cap.uploads[0][1] < len(raw) // 4,
+            f"and it is far smaller ({cap.uploads[0][1] if cap.uploads else 0} vs {len(raw)})",
         )
-        check(_reassemble(cap.uploads) == raw, "the plain parts reassemble to the exact console")
+        check(_reassemble(cap.uploads) == raw, "the gzip reassembles to the exact console")
     finally:
         os.environ.pop("JENKINS_LOG_FILE_MAX_BYTES", None)
         if saved is None:
