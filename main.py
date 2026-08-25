@@ -209,7 +209,8 @@ TAG_USER_OPEN_ID = (
     or (os.getenv("NOTIFY_USER_OPEN_ID") or "").strip()
     or "ou_d7bc33724e2d6ced4050c944c2ca5650"
 ).strip()
-# Duty Bot app id — HTTP callbacks to osedutybot only (not used for @ mentions).
+# Duty Bot app id. Used for the HTTP callbacks to osedutybot AND as the @ mention on any
+# message carrying a slash command — those are addressed to the bot, never to a person.
 DUTY_BOT_OPEN_ID = (os.getenv("DUTY_BOT_OPEN_ID") or "ou_1f6596a9923a2a835918e7e2513595d5").strip()
 
 
@@ -234,6 +235,16 @@ def _tag_user_at_card() -> str:
 
 def _tag_user_at_text() -> str:
     return _at_mention_text(TAG_USER_OPEN_ID)
+
+
+def _duty_bot_at_text() -> str:
+    """@ mention of the duty **bot** — the recipient of every slash command.
+
+    Distinct from :func:`_tag_user_at_text`, which mentions the OM duty *person* on the
+    human-facing done and stuck cards. ``/SuccessProceedNext`` and friends are instructions to
+    osedutybot; addressing them to a human read as the bot shouting commands at OM duty, and
+    meant the duty bot was never the addressee of its own command."""
+    return _at_mention_text(DUTY_BOT_OPEN_ID, "duty bot")
 
 _POLL_RAW = _env("JENKINS_POLL_SECONDS")
 try:
@@ -605,18 +616,20 @@ def _log_card_max_bytes() -> int:
 
 
 def _log_file_max_bytes() -> int:
-    """Lark's per-upload ceiling — a SPLIT threshold, never a truncation point.
+    """Lark's per-upload ceiling. Never a truncation point — nothing is ever omitted.
 
-    A log above it is gzipped, and split into numbered parts only if the gzip is still over.
-    Nothing is ever omitted, so this defaults to Lark's real 30 MB limit rather than something
-    cautious: lowering it only makes the delivery more fragmented, never smaller."""
+    ``POST /open-apis/im/v1/files`` documents "文件大小不得超过 30 MB" and rejects anything larger
+    with HTTP 400 / code 234006. The docs never say whether that MB is decimal or binary, so the
+    cap here is 30,000,000 rather than 30 MiB (31,457,280): a 30 MiB payload would otherwise be
+    1.4 MB over a decimal ceiling and get rejected at the exact moment the code believed it was
+    safe. There is no chunked IM upload and ``msg_type:"file"`` takes nothing but a ``file_key``,
+    so this ceiling cannot be worked around — see :func:`_log_single_file_only`."""
     try:
         return max(
-            4096,
-            min(30 * 1024 * 1024, int(os.getenv("JENKINS_LOG_FILE_MAX_BYTES", "31457280"))),
+            4096, min(30_000_000, int(os.getenv("JENKINS_LOG_FILE_MAX_BYTES", "30000000")))
         )
     except ValueError:
-        return 30 * 1024 * 1024
+        return 30_000_000
 
 
 def _log_file_enabled() -> bool:
@@ -627,6 +640,21 @@ def _log_panel_expanded() -> bool:
     """Open on arrival, so the log is visible without a click. ``0`` starts it collapsed —
     worth trying if a very long panel makes the Feishu client add its own "…more"."""
     return _env_flag("JENKINS_LOG_PANEL_EXPANDED", "1")
+
+
+def _log_single_file_only() -> bool:
+    """ONE attachment or none — never a pile of numbered parts.
+
+    Feishu caps a chat attachment at 30 MB (``im/v1/files``, error 234006) with no chunked
+    variant and no URL field on ``msg_type:"file"``, so a 200 MB console can NEVER arrive as one
+    plain attachment. Rather than fragment it, the card then states the size and points at
+    Jenkins' own ``consoleText`` URL — which is already one link to one complete, unsplit,
+    uncompressed log.
+
+    Set ``0`` to allow the multi-part fallback, or ``JENKINS_LOG_GZIP=1`` to get one small
+    ``.log.gz`` instead. All three deliver every byte; they differ only in how many things you
+    have to click."""
+    return _env_flag("JENKINS_LOG_SINGLE_FILE_ONLY", "1")
 
 
 def _log_gzip_enabled() -> bool:
@@ -812,6 +840,7 @@ def _send_done_card(
     reply_message_id: Optional[str] = None,
     vpn_mode: bool = False,
     log_file_name: Optional[str] = None,
+    log_too_big_bytes: Optional[int] = None,
 ) -> None:
     """Post the finish card. ``console_tail`` is the FULL console text.
 
@@ -849,6 +878,13 @@ def _send_done_card(
     ]
     if log_file_name:
         lines.append(f"- **Full log :** {log_file_name} (attached below)")
+    elif log_too_big_bytes:
+        # Feishu refuses any attachment over 30 MB and offers no chunked upload, so this log
+        # cannot be one file here. Say so, and point at the one place it IS one whole file.
+        lines.append(
+            f"- **Full log :** {log_too_big_bytes:,} bytes — 超过飞书附件上限 30 MB，无法作为单个附件发送。"
+            f"完整日志（一个链接，一个字节都没少）：{console_text_url}"
+        )
     body = "\n".join(lines)
 
     # Window BEFORE sanitising — see _LOG_CARD_SCAN_CHARS. The panel can only ever hold ~24 KB
@@ -1294,14 +1330,17 @@ def _send_duty_text(text: str, chat_id: Optional[str] = None) -> bool:
         logger.warning("empty duty notify text — skip")
         return False
     target_chat = (chat_id or "").strip() or NOTIFY_CHAT_ID
-    if TAG_USER_OPEN_ID:
-        at = _tag_user_at_text()
+    # The @ goes to the duty BOT. This used to tag TAG_USER_OPEN_ID — the OM duty person — so the
+    # chat showed "@CP OM Duty /SuccessProceedNext": a slash command aimed at a human, while the
+    # bot that actually handles it was never mentioned at all.
+    if DUTY_BOT_OPEN_ID:
+        at = _duty_bot_at_text()
         if _send_chat_message(target_chat, "text", {"text": f"{at} {plain}".strip()}):
-            logger.info("duty notify sent (@tag) chat=%s: %r", target_chat, plain[:120])
+            logger.info("duty notify sent (@duty bot) chat=%s: %r", target_chat, plain[:120])
             return True
         logger.warning("duty @tag send failed — retrying plain")
     else:
-        logger.warning("TAG_USER_OPEN_ID missing — sending duty command without @tag")
+        logger.warning("DUTY_BOT_OPEN_ID missing — sending duty command without @tag")
     if _send_chat_message(target_chat, "text", {"text": plain}):
         logger.info("duty notify sent (plain) chat=%s: %r", target_chat, plain[:120])
         return True
@@ -1651,6 +1690,8 @@ def _console_log_display_name(total_bytes: int, base_name: str, cap: int) -> str
     drift apart."""
     if total_bytes <= cap:
         return base_name
+    if _log_single_file_only() and not _log_gzip_enabled():
+        return ""  # nothing will be attached; the card points at the consoleText URL instead
     stem = base_name[:-4] if base_name.lower().endswith(".log") else base_name
     if _log_gzip_enabled():
         return f"{stem}.log.gz"
@@ -1676,6 +1717,9 @@ def _console_log_payloads(
     raw = (text or "").encode("utf-8", errors="replace")
     if len(raw) <= cap:
         return [(base_name, raw)]
+    if _log_single_file_only() and not _log_gzip_enabled():
+        # One attachment or none. Splitting is what the caller asked us not to do.
+        return []
 
     stem = base_name[:-4] if base_name.lower().endswith(".log") else base_name
 
@@ -1931,11 +1975,27 @@ def _jenkins_watch_worker(
             # "FPMS_PROD_SCRIPT_RUN.log" when FPMS_PROD_SCRIPT_RUN.log.gz turns up sends the
             # reader hunting for a file that does not exist.
             log_shown_name = log_file_name
+            log_too_big = 0
             if attach_log:
                 try:
+                    log_bytes = _utf8_len(text or "")
                     log_shown_name = _console_log_display_name(
-                        _utf8_len(text or ""), log_file_name, _log_file_max_bytes()
+                        log_bytes, log_file_name, _log_file_max_bytes()
                     )
+                    if not log_shown_name:
+                        # Over Feishu's 30 MB attachment ceiling with splitting and gzip both
+                        # off. Nothing will be uploaded, so do not attempt it and do not
+                        # apologise for a failure that never happened — the card carries the
+                        # size and the consoleText URL instead.
+                        attach_log = False
+                        log_too_big = log_bytes
+                        logger.info(
+                            "console log %s bytes exceeds the %s byte attachment ceiling — "
+                            "card points at %s instead",
+                            log_bytes,
+                            _log_file_max_bytes(),
+                            ctx["console_text_url"],
+                        )
                 except Exception as exc:
                     logger.warning("console log name prediction failed: %s", exc)
             _send_done_card(
@@ -1950,6 +2010,7 @@ def _jenkins_watch_worker(
                 reply_message_id=reply_mid,
                 vpn_mode=is_vpn_mode,
                 log_file_name=log_shown_name if attach_log else None,
+                log_too_big_bytes=log_too_big or None,
             )
             # VPN: the threaded card + .conf are enough — skip the plain "Done update…" line.
             if not is_vpn_mode:

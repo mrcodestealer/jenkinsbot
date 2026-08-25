@@ -407,6 +407,7 @@ def test_a_console_too_big_to_upload_is_gzipped_not_truncated() -> None:
     saved = os.environ.get("JENKINS_LOG_FILE_MAX_BYTES")
     os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = "1048576"  # 1 MB, so 7 MB must compress
     os.environ["JENKINS_LOG_GZIP"] = "1"  # opt in: plain .log is the default
+    os.environ["JENKINS_LOG_SINGLE_FILE_ONLY"] = "0"  # opt in: no splitting by default
     try:
         with Capture() as cap:
             ok = jb._send_console_log_file(log, file_name="FPMS_PROD_SCRIPT_RUN.log",
@@ -427,6 +428,7 @@ def test_a_console_too_big_to_upload_is_gzipped_not_truncated() -> None:
         )
     finally:
         os.environ.pop("JENKINS_LOG_GZIP", None)
+        os.environ.pop("JENKINS_LOG_SINGLE_FILE_ONLY", None)
         if saved is None:
             os.environ.pop("JENKINS_LOG_FILE_MAX_BYTES", None)
         else:
@@ -443,6 +445,7 @@ def test_a_console_that_will_not_compress_is_split_not_truncated() -> None:
     saved = os.environ.get("JENKINS_LOG_FILE_MAX_BYTES")
     os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = "4096"
     os.environ["JENKINS_LOG_GZIP"] = "1"  # opt in: plain .log is the default
+    os.environ["JENKINS_LOG_SINGLE_FILE_ONLY"] = "0"  # opt in: no splitting by default
     try:
         with Capture() as cap:
             ok = jb._send_console_log_file(log, file_name="big.log", chat_id=CHAT)
@@ -463,6 +466,7 @@ def test_a_console_that_will_not_compress_is_split_not_truncated() -> None:
         )
     finally:
         os.environ.pop("JENKINS_LOG_GZIP", None)
+        os.environ.pop("JENKINS_LOG_SINGLE_FILE_ONLY", None)
         if saved is None:
             os.environ.pop("JENKINS_LOG_FILE_MAX_BYTES", None)
         else:
@@ -490,11 +494,16 @@ def test_the_card_names_the_file_that_actually_arrives() -> None:
             names = [n for n, _b in jb._console_log_payloads(
                 log, base_name=base, cap=jb._log_file_max_bytes())]
             tag = f"gzip={gz_on} cap={cap}"
-            # Either the promise is exactly the file, or it is the partNof<M> stand-in whose
-            # M matches the real part count.
-            ok = names == [shown] or (
-                shown.startswith(base[:-4] + ".partNof")
-                and shown.endswith(f"of{len(names)}.log")
+            # Three legal shapes, and nothing else: the promise is exactly the file; or it is
+            # the partNof<M> stand-in whose M matches the real part count; or nothing is
+            # promised BECAUSE nothing can be attached (the card carries the URL instead).
+            ok = (
+                names == [shown]
+                or (
+                    shown.startswith(base[:-4] + ".partNof")
+                    and shown.endswith(f"of{len(names)}.log")
+                )
+                or (shown == "" and names == [])
             )
             check(ok, f"{tag}: card promises {shown!r}, delivered {names[:2]!r} ({len(names)})")
             check(
@@ -526,28 +535,64 @@ def test_the_delivered_file_is_a_plain_log_by_default() -> None:
     log = "".join(f"[{i:08d}] a line of jenkins output\n" for i in range(80000))
     os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = "1048576"
     try:
+        check(jb._log_single_file_only() is True, "one attachment or none, by default")
         names = [
             n
             for n, _b in jb._console_log_payloads(
                 log, base_name="FPMS_PROD_SCRIPT_RUN.log", cap=jb._log_file_max_bytes()
             )
         ]
-        check(
-            not any(n.endswith(".gz") for n in names),
-            f"nothing is gzipped by default (got {names[:2]!r})",
-        )
-        check(
-            len(names) > 1 and all(n.endswith(".log") for n in names),
-            f"it is plain numbered .log parts (got {names[:2]!r}, {len(names)} parts)",
-        )
+        check(names == [], f"over the ceiling: nothing is split off (got {names[:3]!r})")
         shown = jb._console_log_display_name(
             len(log.encode("utf-8")),
             "FPMS_PROD_SCRIPT_RUN.log",
             jb._log_file_max_bytes(),
         )
+        check(shown == "", f"and no file is named that will not arrive (got {shown!r})")
+    finally:
+        os.environ.pop("JENKINS_LOG_FILE_MAX_BYTES", None)
+
+
+def test_a_console_too_big_to_attach_points_at_the_one_complete_copy() -> None:
+    """Feishu refuses any attachment over 30 MB (im/v1/files, error 234006), there is no chunked
+    IM upload, and msg_type "file" accepts nothing but a file_key — no URL, no Drive token. So a
+    200 MB console can never be one attachment. The card must say that and point at Jenkins'
+    consoleText, which IS one link to one whole unsplit uncompressed log — not silently attach
+    nothing, and not apologise for an upload it never attempted."""
+    log = "".join(f"[{i:08d}] a line of jenkins output\n" for i in range(80000))
+    total = len(log.encode("utf-8"))
+    os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = "1048576"
+    try:
+        card, cap_ = send_card(log, log_file_name=None, log_too_big_bytes=total)
+        summary = summary_of(card)
+        check(f"{total:,}" in summary, f"the card states the real size (got {summary[-200:]!r})")
+        check("30 MB" in summary, "and names the ceiling that blocks it")
         check(
-            shown == f"FPMS_PROD_SCRIPT_RUN.partNof{len(names)}.log",
-            f"the card names them honestly (got {shown!r} for {len(names)} parts)",
+            "consoleText" in summary,
+            f"and points at the complete log (got {summary[-200:]!r})",
+        )
+        check(
+            "(attached below)" not in summary,
+            "it does not promise an attachment that cannot exist",
+        )
+        check(cap_.uploads == [], "nothing was uploaded")
+    finally:
+        os.environ.pop("JENKINS_LOG_FILE_MAX_BYTES", None)
+
+
+def test_the_attachment_ceiling_is_decimal_mb_not_mib() -> None:
+    """im/v1/files documents "30 MB" and never says decimal or binary. Clamping at 30 MiB
+    (31,457,280) means a payload the code believes is legal can be 1.4 MB over a decimal ceiling
+    and come back 234006 — rejected at the exact moment we thought we were safe."""
+    check(
+        jb._log_file_max_bytes() == 30_000_000,
+        f"the ceiling is 30,000,000 (got {jb._log_file_max_bytes():,})",
+    )
+    os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = "31457280"
+    try:
+        check(
+            jb._log_file_max_bytes() == 30_000_000,
+            f"a 30 MiB override is clamped down (got {jb._log_file_max_bytes():,})",
         )
     finally:
         os.environ.pop("JENKINS_LOG_FILE_MAX_BYTES", None)
@@ -714,9 +759,10 @@ def test_the_new_tunables_do_not_require_a_env_entry() -> None:
         )
     check(jb._log_card_max_bytes() == 24000, "card embed default fills the message cap")
     check(
-        jb._log_file_max_bytes() == 30 * 1024 * 1024,
-        "the per-file ceiling defaults to Lark's real 30 MB, since it only splits",
+        jb._log_file_max_bytes() == 30_000_000,
+        "the per-file ceiling is Feishu's 30 MB, read as decimal so 234006 cannot surprise us",
     )
+    check(jb._log_single_file_only() is True, "one attachment or none, by default")
     check(jb._log_file_enabled() is True, "the attachment is on by default")
     check(jb._log_panel_expanded() is True, "the panel is open by default")
 

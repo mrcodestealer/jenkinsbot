@@ -194,6 +194,42 @@ def test_send_duty_text_defaults_to_the_duty_chat() -> None:
     check(sent == [DUTY_CHAT, REAL_CHAT], f"explicit chat wins, default holds (got {sent!r})")
 
 
+def test_a_slash_command_is_addressed_to_the_duty_bot_not_a_person() -> None:
+    """``/SuccessProceedNext`` is an instruction to osedutybot, so the @ has to be the BOT.
+
+    It used to be ``TAG_USER_OPEN_ID`` — the OM duty *person* — so the chat showed
+    "@CP OM Duty /SuccessProceedNext": a slash command shouted at a human, while the bot that
+    actually handles it was never the addressee. ``DUTY_BOT_OPEN_ID`` existed for exactly this
+    and was referenced nowhere in the module."""
+    sent: list[str] = []
+    saved = jb._send_chat_message
+    jb._send_chat_message = lambda chat_id, t, c, **kw: (sent.append(c["text"]), True)[1]
+    try:
+        jb._send_duty_text("/SuccessProceedNext", REAL_CHAT)
+        jb._send_duty_text("/FailedStop", REAL_CHAT)
+    finally:
+        jb._send_chat_message = saved
+    check(len(sent) == 2, f"both commands were sent (got {len(sent)})")
+    for text in sent:
+        check(
+            jb.DUTY_BOT_OPEN_ID in text,
+            f"the duty bot is the addressee (got {text!r})",
+        )
+        check(
+            jb.TAG_USER_OPEN_ID not in text,
+            f"the OM duty person is NOT tagged with a slash command (got {text!r})",
+        )
+    # And the human-facing card @ must NOT have been switched over with it.
+    check(
+        jb.TAG_USER_OPEN_ID in jb._tag_user_at_card(),
+        "the done card still @-mentions the OM duty person",
+    )
+    check(
+        jb.DUTY_BOT_OPEN_ID != jb.TAG_USER_OPEN_ID,
+        "the two ids are genuinely different recipients",
+    )
+
+
 def test_an_unknown_mode_notifies_nobody() -> None:
     """Unchanged behaviour, pinned so the chat threading did not accidentally widen it."""
     with Capture(http_ok=True) as cap:
