@@ -17,19 +17,26 @@ Both halves of that are easy to break in ways nobody notices until a real deploy
 * **The attachment lands in the wrong place.** ``_send_file_message`` is chat-only, so using it
   would drop the .log into the chat root while the card sits in a thread — the same class of bug
   as ``tests/test_duty_callback_chat.py``.
-* **The log path swallows the duty callbacks.** ``_send_console_log_file`` runs BEFORE
-  ``_notify_duty_after_inform_watch`` in ``_jenkins_watch_worker``. An exception escaping it parks
-  an ``/updatemore`` queue at ``waiting_jenkins`` forever — the incident
-  ``tests/test_watch_dedupe_and_notify_failures.py`` was written about.
+* **The log gets truncated again.** A real FPMS_PROD_SCRIPT_RUN build produced a 194 MB console
+  and the attachment arrived as an 8 MB file whose first line read
+  ``[… 194202218 earlier bytes omitted …]`` — worse than useless, because it looked complete.
+  Lark's 30 MB per-upload ceiling is a reason to COMPRESS, never a reason to cut.
+* **The log path delays or swallows the duty callbacks.** ``_send_console_log_file`` runs AFTER
+  ``_notify_duty_after_inform_watch`` in ``_jenkins_watch_worker``, precisely because gzipping and
+  uploading 194 MB takes real time and the duty bot's ``/updatemore`` queue has a watchdog. If the
+  order flips back, or an exception escapes, a queue parks at ``waiting_jenkins`` forever — the
+  incident ``tests/test_watch_dedupe_and_notify_failures.py`` was written about.
 """
 
 from __future__ import annotations
 
+import gzip
 import inspect
 import json
 import os
 import re
 import sys
+import time
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -90,9 +97,10 @@ class Capture:
             return True
 
         def fake_upload(path, file_name, *, timeout=120):
-            with open(path, encoding="utf-8") as fh:
-                head = fh.read(40)
-            self.uploads.append((file_name, os.path.getsize(path), head))
+            # Binary: a payload over Lark's per-upload cap arrives gzipped.
+            with open(path, "rb") as fh:
+                blob = fh.read()
+            self.uploads.append((file_name, len(blob), blob))
             return self._file_key
 
         def fake_error(msg, *a, **kw):
@@ -195,7 +203,7 @@ def test_the_log_lives_in_an_expand_collapse_block_not_the_summary() -> None:
     panel = panel_of(card)
     check(panel is not None, "the console is in a collapsible_panel")
     if panel:
-        check(panel["expanded"] is False, "the panel arrives collapsed")
+        check(panel["expanded"] is True, "the panel arrives already open, not hidden")
         check(
             panel["elements"][0]["tag"] == "markdown",
             f"the log is in a markdown component, not {panel['elements'][0]['tag']!r} "
@@ -231,7 +239,10 @@ def test_the_last_ten_lines_clamp_is_gone() -> None:
     content = panel["elements"][0]["content"] if panel else ""
     for probe in ("line 0\n", "line 25\n", "line 59"):
         check(probe in content, f"{probe.strip()!r} is present in the panel")
-    check("(complete)" in panel["header"]["title"]["content"], "the panel says it is complete")
+    check(
+        panel["header"]["title"]["content"].startswith("**Console log** — complete"),
+        f"the panel says it is complete (got {panel['header']['title']['content']!r})",
+    )
 
 
 def test_a_pathological_summary_never_blocks_the_send() -> None:
@@ -371,29 +382,201 @@ def test_the_uploaded_log_is_the_whole_console() -> None:
         jb._send_console_log_file(log, file_name="x.log", chat_id=CHAT, reply_message_id=THREAD)
     check(
         cap.uploads and cap.uploads[0][1] == len(log.encode("utf-8")),
-        f"every byte of a {len(log)}-byte console was uploaded (got {cap.uploads!r})",
+        f"every byte of a {len(log)}-byte console was uploaded (got {len(cap.uploads)} file(s))",
+    )
+    check(
+        cap.uploads and cap.uploads[0][0] == "x.log",
+        "a log that fits stays a plain, one-click .log",
     )
 
 
-def test_an_oversized_log_is_capped_and_says_so() -> None:
+def _reassemble(uploads: list[tuple[str, int, bytes]]) -> bytes:
+    out = b""
+    for name, _size, blob in uploads:
+        out += gzip.decompress(blob) if name.endswith(".gz") else blob
+    return out
+
+
+def test_a_console_too_big_to_upload_is_gzipped_not_truncated() -> None:
+    """The bug the user hit: a 194 MB console arrived as an 8 MB file whose first line read
+    "[… 194202218 earlier bytes omitted …]". Not a byte may go missing now — Lark's 30 MB
+    per-upload ceiling is a reason to COMPRESS, never a reason to cut."""
+    log = "".join(f"[{i:08d}] applying migration batch, rows=4211, elapsed=0.31s\n"
+                  for i in range(120000))  # ~7 MB
+    raw = log.encode("utf-8")
     saved = os.environ.get("JENKINS_LOG_FILE_MAX_BYTES")
-    os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = "8192"
+    os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = "1048576"  # 1 MB, so 7 MB must compress
     try:
         with Capture() as cap:
-            jb._send_console_log_file(
-                "x" * (2 * 1024 * 1024), file_name="x.log", chat_id=CHAT
-            )
-        name, size, head = cap.uploads[0] if cap.uploads else ("", 0, "")
-        # <= cap, not cap + slack: the marker is prepended AFTER the tail is cut, so the tail
-        # budget has to reserve room for it. At the documented 30 MB ceiling an overshoot is
-        # rejected by Lark outright and no attachment arrives at all.
-        check(size <= 8192, f"the upload never exceeds its own cap (got {size} bytes / 8192)")
-        check(head.startswith("[…"), f"the cut is announced in the file (head={head!r})")
+            ok = jb._send_console_log_file(log, file_name="FPMS_PROD_SCRIPT_RUN.log",
+                                           chat_id=CHAT, reply_message_id=THREAD)
+        check(ok is True, "the oversized log still reports success")
+        check(
+            len(cap.uploads) == 1 and cap.uploads[0][0] == "FPMS_PROD_SCRIPT_RUN.log.gz",
+            f"it ships as ONE gzip, not many parts (got {[u[0] for u in cap.uploads]!r})",
+        )
+        check(
+            _reassemble(cap.uploads) == raw,
+            f"the delivered bytes are the console, byte for byte "
+            f"({len(_reassemble(cap.uploads))} vs {len(raw)})",
+        )
+        check(
+            b"earlier bytes omitted" not in _reassemble(cap.uploads),
+            "NO omission marker survives anywhere in the delivered log",
+        )
     finally:
         if saved is None:
             os.environ.pop("JENKINS_LOG_FILE_MAX_BYTES", None)
         else:
             os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = saved
+
+
+def test_a_console_that_will_not_compress_is_split_not_truncated() -> None:
+    """Last resort: incompressible output in the hundreds of MB. Still every byte, just across
+    numbered parts."""
+    import secrets
+
+    log = secrets.token_hex(600_000)  # 1.2 MB of hex — gzip barely helps
+    raw = log.encode("utf-8")
+    saved = os.environ.get("JENKINS_LOG_FILE_MAX_BYTES")
+    os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = "4096"
+    try:
+        with Capture() as cap:
+            ok = jb._send_console_log_file(log, file_name="big.log", chat_id=CHAT)
+        check(ok is True, "the split delivery reports success")
+        check(len(cap.uploads) > 1, f"it was split (got {len(cap.uploads)} part(s))")
+        check(
+            all("part" in n and n.endswith(".log.gz") for n, _s, _b in cap.uploads),
+            f"parts are named for reassembly (got {[u[0] for u in cap.uploads][:3]!r}…)",
+        )
+        check(
+            all(size <= 4096 for _n, size, _b in cap.uploads),
+            "no part exceeds the per-upload ceiling",
+        )
+        check(_reassemble(cap.uploads) == raw, "the parts reassemble to the exact console")
+        check(
+            len(cap.sent) == len(cap.uploads),
+            f"one file message per part (sent {len(cap.sent)}, parts {len(cap.uploads)})",
+        )
+    finally:
+        if saved is None:
+            os.environ.pop("JENKINS_LOG_FILE_MAX_BYTES", None)
+        else:
+            os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = saved
+
+
+def test_the_card_names_the_file_that_actually_arrives() -> None:
+    """The card is sent BEFORE the gzip runs, so it has to predict the delivered name. Promising
+    "FPMS_PROD_SCRIPT_RUN.log" and then delivering "FPMS_PROD_SCRIPT_RUN.log.gz" sends the reader
+    hunting for a file that does not exist — and an earlier draft of this even produced
+    "FPMS_PROD_SCRIPT_RUN.log.gz.log.gz", because the predicted name was fed back in as the base."""
+    base = "FPMS_PROD_SCRIPT_RUN.log"
+    log = "".join(f"[{i:08d}] a line of jenkins output\n" for i in range(80000))
+    total = len(log.encode("utf-8"))
+    saved_cap = os.environ.get("JENKINS_LOG_FILE_MAX_BYTES")
+    saved_gz = os.environ.get("JENKINS_LOG_GZIP")
+    for gz_on, cap in (("1", 1048576), ("0", 1048576), ("1", None)):
+        os.environ["JENKINS_LOG_GZIP"] = gz_on
+        if cap is None:
+            os.environ.pop("JENKINS_LOG_FILE_MAX_BYTES", None)
+        else:
+            os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = str(cap)
+        try:
+            shown = jb._console_log_display_name(total, base, jb._log_file_max_bytes())
+            names = [n for n, _b in jb._console_log_payloads(
+                log, base_name=base, cap=jb._log_file_max_bytes())]
+            tag = f"gzip={gz_on} cap={cap}"
+            # Either the promise is exactly the file, or it is the partNof<M> stand-in whose
+            # M matches the real part count.
+            ok = names == [shown] or (
+                shown.startswith(base[:-4] + ".partNof")
+                and shown.endswith(f"of{len(names)}.log")
+            )
+            check(ok, f"{tag}: card promises {shown!r}, delivered {names[:2]!r} ({len(names)})")
+            check(
+                not any(".log.gz.log" in n or ".partNof" in n for n in names),
+                f"{tag}: no doubled suffix in {names[:2]!r}",
+            )
+        finally:
+            pass
+    for key, val in (("JENKINS_LOG_FILE_MAX_BYTES", saved_cap), ("JENKINS_LOG_GZIP", saved_gz)):
+        if val is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = val
+
+
+def test_gzip_can_be_traded_for_plain_clickable_parts() -> None:
+    """A .gz has to be unzipped before you can read it. JENKINS_LOG_GZIP=0 delivers plain .log
+    parts instead — more files, but each opens in one click. Neither loses a byte."""
+    log = "".join(f"[{i:08d}] a line of jenkins output\n" for i in range(80000))
+    raw = log.encode("utf-8")
+    saved = os.environ.get("JENKINS_LOG_GZIP")
+    os.environ["JENKINS_LOG_GZIP"] = "0"
+    os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = "1048576"
+    try:
+        with Capture() as cap:
+            ok = jb._send_console_log_file(log, file_name="P.log", chat_id=CHAT)
+        check(ok is True, "the plain-parts delivery succeeds")
+        check(
+            cap.uploads and all(n.endswith(".log") for n, _s, _b in cap.uploads),
+            f"every part is a plain .log (got {[u[0] for u in cap.uploads][:3]!r})",
+        )
+        check(
+            all(size <= 1048576 for _n, size, _b in cap.uploads),
+            "no plain part exceeds the per-upload ceiling",
+        )
+        check(_reassemble(cap.uploads) == raw, "the plain parts reassemble to the exact console")
+    finally:
+        os.environ.pop("JENKINS_LOG_FILE_MAX_BYTES", None)
+        if saved is None:
+            os.environ.pop("JENKINS_LOG_GZIP", None)
+        else:
+            os.environ["JENKINS_LOG_GZIP"] = saved
+
+
+def test_the_panel_never_states_arithmetic_the_reader_could_falsify() -> None:
+    """An earlier draft printed "last N of M bytes" plus "K earlier bytes omitted" where N+K != M,
+    because M was measured before ANSI stripping and N after. Two numbers that do not add up read
+    as a lie about exactly the thing the user is watching. Now: the true total, and a plain
+    statement of complete-or-tail."""
+    for label, log in (
+        ("ansi", "\x1b[31mred build\x1b[0m\nFinished: FAILURE\n"),
+        ("clean", SMALL_LOG),
+        ("huge", "".join(f"line {i}\n" for i in range(200000))),
+    ):
+        card, _cap = send_card(log, log_file_name="P.log")
+        title = panel_of(card)["header"]["title"]["content"]
+        total = len(log.encode("utf-8"))
+        check(
+            title in (
+                f"**Console log** — complete ({total} bytes)",
+                f"**Console log** — tail only, {total} bytes total",
+            ),
+            f"{label}: title is one of the two honest forms, with the TRUE total (got {title!r})",
+        )
+        # No "X of Y" arithmetic left to be wrong.
+        check(" of " not in title.replace(" bytes total", ""), f"{label}: no subtraction claimed")
+
+
+def test_a_huge_console_does_not_stall_the_card() -> None:
+    """Sanitising 185 MB with three regex passes to embed 24 KB of it took minutes and a second
+    copy of the log in memory. The card windows the tail first."""
+    log = "x" * 40_000_000 + "\nFinished: SUCCESS\n"
+    t0 = time.time()
+    card, _cap = send_card(log, log_file_name="x.log")
+    elapsed = time.time() - t0
+    check(elapsed < 5.0, f"a 40 MB console builds a card in {elapsed:.1f}s (want < 5s)")
+    panel = panel_of(card)
+    check(panel is not None, "the panel is still there")
+    check(
+        "Finished: SUCCESS" in panel["elements"][0]["content"],
+        "and it still ends at the real end of the log",
+    )
+    check(
+        str(len(log.encode())) in panel["header"]["title"]["content"],
+        f"the title reports the TRUE total size (got {panel['header']['title']['content']!r})",
+    )
 
 
 def test_an_empty_console_is_never_uploaded() -> None:
@@ -435,9 +618,7 @@ def test_a_failed_upload_corrects_the_card_it_already_promised() -> None:
     "(attached below)" by the time an upload can fail — so the failure has to be said out loud,
     in the same thread, or the reader waits forever for a file that will never arrive."""
     src = inspect.getsource(jb._jenkins_watch_worker)
-    i_log = src.find("_send_console_log_file(")
-    i_notify = src.find("_send_done_notify(")
-    window = src[i_log:i_notify]
+    window = src[src.find("_send_console_log_file(") :]
     check(
         "if not attached:" in window,
         "the worker branches on whether the attachment actually landed",
@@ -448,24 +629,25 @@ def test_a_failed_upload_corrects_the_card_it_already_promised() -> None:
     )
     check(
         window.count("except Exception") >= 2,
-        "both the upload and its correction are wrapped, so neither can skip the duty callback",
+        "both the upload and its correction are wrapped, so neither can abandon the watcher",
     )
 
 
-def test_the_log_send_sits_between_the_card_and_the_duty_callbacks() -> None:
+def test_the_log_upload_never_delays_the_duty_callbacks() -> None:
+    """Gzipping and uploading a 194 MB console takes real time. The duty bot resolves its
+    /updatemore queue on a watchdog, so the upload must be the LAST thing the watcher does —
+    after the card, after the finish tag, and after the duty callback."""
     src = inspect.getsource(jb._jenkins_watch_worker)
     src = re.sub(r'""".*?"""', "", src, flags=re.S)  # drop docstrings/comment prose
     src = re.sub(r"#[^\n]*", "", src)
     i_card = src.find("_send_done_card(")
     i_log = src.find("_send_console_log_file(")
     i_duty = src.find("_notify_duty_after_inform_watch(")
-    check(i_card >= 0 and i_log >= 0 and i_duty >= 0, "all three calls are present")
+    i_vpn = src.find("_handle_vpn_conf_after_success(")
+    check(min(i_card, i_log, i_duty, i_vpn) >= 0, "all four calls are present")
     check(i_card < i_log, "the card goes out before the attachment")
-    check(i_log < i_duty, "the attachment goes out before the duty callback")
-    check(
-        "except Exception" in src[i_log:i_duty],
-        "the attachment is wrapped, so it cannot skip the duty callback",
-    )
+    check(i_duty < i_log, "the duty callback fires BEFORE the upload, never behind it")
+    check(i_vpn < i_log, "the VPN .conf goes out before the upload too")
 
 
 def test_the_new_tunables_do_not_require_a_env_entry() -> None:
@@ -483,16 +665,19 @@ def test_the_new_tunables_do_not_require_a_env_entry() -> None:
             "_env(" not in src,
             f"{fn.__name__} reads os.getenv, not the raising _env()",
         )
-    check(jb._log_card_max_bytes() == 18000, "card embed default is 18000")
-    check(jb._log_file_max_bytes() == 8 * 1024 * 1024, "file cap default is 8 MB")
+    check(jb._log_card_max_bytes() == 24000, "card embed default fills the message cap")
+    check(
+        jb._log_file_max_bytes() == 30 * 1024 * 1024,
+        "the per-file ceiling defaults to Lark's real 30 MB, since it only splits",
+    )
     check(jb._log_file_enabled() is True, "the attachment is on by default")
-    check(jb._log_panel_expanded() is False, "the panel is collapsed by default")
+    check(jb._log_panel_expanded() is True, "the panel is open by default")
 
     for bad in ("", "not-a-number"):
         os.environ["JENKINS_LOG_CARD_MAX_BYTES"] = bad
         try:
             check(
-                jb._log_card_max_bytes() == 18000,
+                jb._log_card_max_bytes() == 24000,
                 f"a junk JENKINS_LOG_CARD_MAX_BYTES={bad!r} falls back to the default",
             )
         finally:

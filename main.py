@@ -1,3 +1,4 @@
+import gzip
 import json
 import logging
 import os
@@ -250,10 +251,14 @@ STUCK_SECONDS = int(_env("JENKINS_STUCK_SECONDS") or "600")
 # 28000 is safely under both readings of "30 KB" (30000 and 30720).
 _CARD_BODY_LIMIT_BYTES = 28000
 
-# Room kept free for the "[… N earlier bytes omitted …]" marker, so prepending it cannot push
-# a capped .log back over the cap. At the documented 30 MB ceiling an overshoot is rejected by
-# Lark outright and no attachment arrives at all.
-_LOG_MARKER_RESERVE_BYTES = 256
+# Sanitising a 190 MB console to embed 24 KB of it measured ~3s wall and one extra full copy of
+# the log (432 MB peak RSS against a 245 MB floor). The wall time is not the problem — the GIL
+# hold is: a single _LOG_FENCE_RE/_LOG_CTRL_RE .sub() over the whole log ran ~1.8s
+# UNINTERRUPTIBLE, and Flask serves on threads in this same process (app.run(threaded=True)), so
+# it stalled every webhook response and websocket heartbeat for that long. The card path
+# therefore takes a window off the END first; measured 0.03s after. Far more than any embed
+# budget can use, even before ANSI stripping shrinks it.
+_LOG_CARD_SCAN_CHARS = 400_000
 
 # Jenkins consoles carry ANSI colour from shell steps. Feishu renders the escapes as visible
 # garbage and they eat the byte budget, so they come out before the log is embedded.
@@ -594,21 +599,24 @@ def _log_card_max_bytes() -> int:
     escaping inflates this by ~1.06x for a plain log and up to 2x for a log full of Windows
     paths or embedded JSON."""
     try:
-        return max(0, min(24000, int(os.getenv("JENKINS_LOG_CARD_MAX_BYTES", "18000"))))
+        return max(0, min(24000, int(os.getenv("JENKINS_LOG_CARD_MAX_BYTES", "24000"))))
     except ValueError:
-        return 18000
+        return 24000
 
 
 def _log_file_max_bytes() -> int:
-    """Cap on the uploaded ``.log``. Lark's own cap is 30 MB, but the upload blocks the
-    watcher thread and the duty callbacks sit downstream of it — so default far lower."""
+    """Lark's per-upload ceiling — a SPLIT threshold, never a truncation point.
+
+    A log above it is gzipped, and split into numbered parts only if the gzip is still over.
+    Nothing is ever omitted, so this defaults to Lark's real 30 MB limit rather than something
+    cautious: lowering it only makes the delivery more fragmented, never smaller."""
     try:
         return max(
             4096,
-            min(30 * 1024 * 1024, int(os.getenv("JENKINS_LOG_FILE_MAX_BYTES", "8388608"))),
+            min(30 * 1024 * 1024, int(os.getenv("JENKINS_LOG_FILE_MAX_BYTES", "31457280"))),
         )
     except ValueError:
-        return 8 * 1024 * 1024
+        return 30 * 1024 * 1024
 
 
 def _log_file_enabled() -> bool:
@@ -616,8 +624,16 @@ def _log_file_enabled() -> bool:
 
 
 def _log_panel_expanded() -> bool:
-    """``1`` opens the console panel on arrival instead of collapsed."""
-    return _env_flag("JENKINS_LOG_PANEL_EXPANDED", "0")
+    """Open on arrival, so the log is visible without a click. ``0`` starts it collapsed —
+    worth trying if a very long panel makes the Feishu client add its own "…more"."""
+    return _env_flag("JENKINS_LOG_PANEL_EXPANDED", "1")
+
+
+def _log_gzip_enabled() -> bool:
+    """A console over Lark's per-upload ceiling is gzipped into ONE file by default. Set
+    ``JENKINS_LOG_GZIP=0`` to get plain ``.partNofM.log`` files instead — more of them, but
+    each opens in one click with no unzip step. Either way nothing is omitted."""
+    return _env_flag("JENKINS_LOG_GZIP", "1")
 
 
 def _log_panel_code_block() -> bool:
@@ -663,6 +679,20 @@ def _console_tail_bytes(text: str, max_bytes: int) -> Tuple[str, int]:
     if 0 <= nl < max(1, len(cut) // 10) and nl < len(cut) - 1:
         cut = cut[nl + 1 :]
     return cut, len(raw) - len(cut.encode("utf-8"))
+
+
+def _utf8_len(text: str, *, chunk: int = 1 << 20) -> int:
+    """UTF-8 byte length of ``text`` without materialising a second copy of a huge log.
+
+    ``str`` slices on code points, so summing the chunks gives the exact same total as
+    encoding the whole thing at once — just without the transient 185 MB buffer."""
+    s = text or ""
+    if len(s) <= chunk:
+        return len(s.encode("utf-8", errors="replace"))
+    return sum(
+        len(s[i : i + chunk].encode("utf-8", errors="replace"))
+        for i in range(0, len(s), chunk)
+    )
 
 
 def _safe_log_filename(pipeline: str, build: int) -> str:
@@ -817,8 +847,13 @@ def _send_done_card(
         lines.append(f"- **Full log :** {log_file_name} (attached below)")
     body = "\n".join(lines)
 
-    clean = _console_text_for_card(console_tail) if show_console else ""
-    total_bytes = len(clean.encode("utf-8")) if clean else 0
+    # Window BEFORE sanitising — see _LOG_CARD_SCAN_CHARS. The panel can only ever hold ~24 KB
+    # anyway, and the complete log ships as the attachment.
+    raw_console = console_tail or ""
+    total_bytes = _utf8_len(raw_console) if show_console else 0
+    window = raw_console[-_LOG_CARD_SCAN_CHARS:] if show_console else ""
+    clean = _console_text_for_card(window) if show_console else ""
+    windowed = len(window) < len(raw_console)
 
     def _card_for(embed_bytes: int) -> Tuple[Dict[str, Any], int, int]:
         elements: List[Dict[str, Any]] = [
@@ -829,19 +864,20 @@ def _send_done_card(
             try:
                 tail, dropped = _console_tail_bytes(clean, embed_bytes)
                 if tail.strip():
-                    if dropped:
+                    # Only the sanitised-and-sliced text is in hand here, so a byte count for
+                    # what is SHOWN cannot be reconciled with the raw total. Report the raw
+                    # total (the real size of the log) and say plainly whether this is all of
+                    # it — no subtraction the reader could check and find wrong.
+                    if windowed or dropped:
                         note = (
                             f" — full log attached as {log_file_name}"
                             if log_file_name
-                            else ""
+                            else " — see the consoleText link above"
                         )
-                        title = (
-                            f"**Console log** — last {len(tail.encode('utf-8'))} "
-                            f"of {total_bytes} bytes"
-                        )
-                        tail = f"[… {dropped} earlier bytes omitted{note} …]\n{tail}"
+                        title = f"**Console log** — tail only, {total_bytes} bytes total"
+                        tail = f"[… earlier output omitted{note} …]\n{tail}"
                     else:
-                        title = f"**Console log** — {total_bytes} bytes (complete)"
+                        title = f"**Console log** — complete ({total_bytes} bytes)"
                     elements.append(_console_panel_element(tail, title=title))
                     embedded = len(tail.encode("utf-8"))
             except Exception as exc:
@@ -1602,6 +1638,78 @@ def _upload_file_lark(
     return (data.get("data") or {}).get("file_key")
 
 
+def _console_log_display_name(total_bytes: int, base_name: str, cap: int) -> str:
+    """What the card should CALL the attachment.
+
+    Decided from the raw byte count alone, so the card can go out before the (multi-second)
+    gzip runs and still name the file the reader will actually receive.
+    :func:`_console_log_payloads` derives its names from the same rule, so the two cannot
+    drift apart."""
+    if total_bytes <= cap:
+        return base_name
+    stem = base_name[:-4] if base_name.lower().endswith(".log") else base_name
+    if _log_gzip_enabled():
+        return f"{stem}.log.gz"
+    # Plain parts are exactly cap-sized, so the count is known without doing the work.
+    parts = -(-total_bytes // cap)
+    return f"{stem}.partNof{parts}.log"
+
+
+def _console_log_payloads(
+    text: str, *, base_name: str, cap: int
+) -> List[Tuple[str, bytes]]:
+    """``[(file_name, blob), …]`` carrying the **complete** console log — nothing omitted.
+
+    Lark caps a single upload at 30 MB, which is the only reason this returns a list rather
+    than one blob. Tiers, in order of how much the reader has to do:
+
+    1. Fits as-is -> plain ``{pipeline}.log``, openable in one click.
+    2. Too big, gzip allowed -> ONE ``{pipeline}.log.gz``. A Jenkins console compresses
+       10-30x, so ~190 MB lands well under a megabyte.
+    3. Too big for even a gzip (or ``JENKINS_LOG_GZIP=0``) -> numbered parts. Every byte
+       still ships; with gzip off the parts are plain ``.log`` files you can open directly.
+    """
+    raw = (text or "").encode("utf-8", errors="replace")
+    if len(raw) <= cap:
+        return [(base_name, raw)]
+
+    stem = base_name[:-4] if base_name.lower().endswith(".log") else base_name
+
+    if not _log_gzip_enabled():
+        # Plain parts: each chunk IS the payload, so cap bounds it directly.
+        chunks = range(0, len(raw), cap)
+        total = len(chunks)
+        return [
+            (f"{stem}.part{n}of{total}.log", raw[i : i + cap])
+            for n, i in enumerate(chunks, 1)
+        ]
+
+    gz = gzip.compress(raw, compresslevel=6)
+    if len(gz) <= cap:
+        return [(f"{stem}.log.gz", gz)]
+
+    # Only reachable for a console in the hundreds of MB that barely compresses. Size chunks by
+    # the compression ratio we just measured, NOT by ``cap`` — chunking raw bytes at ``cap``
+    # when ``cap`` bounds the COMPRESSED size produces ratio-times more parts than the ceiling
+    # needs (a 22x-compressing log gave 23 uploads where 2 would do).
+    ratio = max(1.0, len(raw) / max(1, len(gz)))
+    chunk = max(cap, int(cap * ratio * 0.9))
+    parts: List[bytes] = []
+    for _attempt in range(8):
+        parts = [
+            gzip.compress(raw[i : i + chunk], compresslevel=6)
+            for i in range(0, len(raw), chunk)
+        ]
+        if all(len(p) <= cap for p in parts):
+            break
+        chunk = max(cap // 2, chunk // 2)
+    total = len(parts)
+    return [
+        (f"{stem}.part{n}of{total}.log.gz", blob)
+        for n, blob in enumerate(parts, 1)
+    ]
+
+
 def _send_console_log_file(
     console_text: str,
     *,
@@ -1609,13 +1717,13 @@ def _send_console_log_file(
     chat_id: str,
     reply_message_id: Optional[str] = None,
 ) -> bool:
-    """Upload the full console log and post it as a clickable ``file`` message in the card's
-    own thread.
+    """Upload the **whole** console log and post it as clickable file message(s) in the card's
+    own thread. Nothing is ever truncated — see :func:`_console_log_payloads` for how a log
+    larger than Lark's per-upload cap is gzipped, and split only if it has to be.
 
-    **Never raises.** The duty-bot callbacks in :func:`_jenkins_watch_worker` run downstream of
-    this call, and an escaping exception would park an ``/updatemore`` queue at
-    ``waiting_jenkins`` forever — the incident ``tests/test_watch_dedupe_and_notify_failures.py``
-    was written about.
+    **Never raises.** This runs after the duty-bot callbacks in
+    :func:`_jenkins_watch_worker`, but an escaping exception would still abandon the watcher
+    mid-cleanup, and a 185 MB console is exactly when that would happen.
 
     Uses :func:`_emit_message`, not :func:`_send_file_message`: the latter routes to
     ``_send_chat_message`` (chat_id only), which would drop the attachment into the chat root
@@ -1625,52 +1733,44 @@ def _send_console_log_file(
         if not text.strip():
             logger.info("console log attach skipped: empty log file=%s", file_name)
             return False  # Lark rejects an empty upload outright
-        cap = _log_file_max_bytes()
-        body, dropped = _console_tail_bytes(
-            text, max(1024, cap - _LOG_MARKER_RESERVE_BYTES)
+        payloads = _console_log_payloads(
+            text, base_name=file_name, cap=_log_file_max_bytes()
         )
-        if dropped:
-            body = (
-                f"[… {dropped} earlier bytes omitted — log exceeded "
-                f"JENKINS_LOG_FILE_MAX_BYTES={cap} …]\n"
-            ) + body
         tmpdir = tempfile.mkdtemp(prefix="jenkinslog_")
+        sent = 0
         try:
-            dest = os.path.join(tmpdir, file_name)
-            # _fetch_console_text decodes via r.apparent_encoding, so pin utf-8 on the way
-            # out. newline="" stops Windows rewriting every \n to \r\n in a log that may
-            # already carry CRLF.
-            with open(dest, "w", encoding="utf-8", errors="replace", newline="") as fh:
-                fh.write(body)
-            size = os.path.getsize(dest)
-            if size <= 0:
-                logger.warning("console log attach skipped: 0 bytes file=%s", file_name)
-                return False
-            file_key = _upload_file_lark(dest, file_name, timeout=60)
-            if not file_key:
-                logger.error(
-                    "console log upload FAILED file=%s bytes=%s chat=%s — the done card and "
-                    "the duty callbacks are unaffected",
-                    file_name,
-                    size,
-                    chat_id,
-                )
-                return False
-            ok = _emit_message(
-                "file",
-                {"file_key": file_key},
-                chat_id=chat_id,
-                reply_message_id=reply_message_id,
-            )
+            for name, blob in payloads:
+                if not blob:
+                    continue
+                dest = os.path.join(tmpdir, name)
+                # Binary: the payload is already encoded (and may be gzip), so nothing here
+                # may re-encode it or rewrite \n to \r\n on Windows.
+                with open(dest, "wb") as fh:
+                    fh.write(blob)
+                file_key = _upload_file_lark(dest, name, timeout=300)
+                if not file_key:
+                    logger.error(
+                        "console log upload FAILED file=%s bytes=%s chat=%s", name, len(blob), chat_id
+                    )
+                    continue
+                if _emit_message(
+                    "file",
+                    {"file_key": file_key},
+                    chat_id=chat_id,
+                    reply_message_id=reply_message_id,
+                ):
+                    sent += 1
+                os.unlink(dest)
             logger.info(
-                "console log attached ok=%s file=%s bytes=%s chat=%s thread=%s",
-                ok,
-                file_name,
-                size,
+                "console log attached %s/%s part(s) raw=%s file=%s chat=%s thread=%s",
+                sent,
+                len(payloads),
+                len(text),
+                payloads[0][0] if payloads else file_name,
                 chat_id,
                 bool((reply_message_id or "").strip()),
             )
-            return ok
+            return sent == len(payloads) and sent > 0
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
     except Exception as exc:
@@ -1819,6 +1919,21 @@ def _jenkins_watch_worker(
             attach_log = _log_file_enabled() and _console_wanted_for(
                 result, vpn_mode=is_vpn_mode
             )
+            # What the card CALLS the attachment. Kept separate from log_file_name, which is
+            # the base _console_log_payloads derives its own names from — feeding this back in
+            # as the base yields "FPMS_PROD_SCRIPT_RUN.log.gz.log.gz".
+            #
+            # A console over Lark's per-upload ceiling arrives gzipped, and a card promising
+            # "FPMS_PROD_SCRIPT_RUN.log" when FPMS_PROD_SCRIPT_RUN.log.gz turns up sends the
+            # reader hunting for a file that does not exist.
+            log_shown_name = log_file_name
+            if attach_log:
+                try:
+                    log_shown_name = _console_log_display_name(
+                        _utf8_len(text or ""), log_file_name, _log_file_max_bytes()
+                    )
+                except Exception as exc:
+                    logger.warning("console log name prediction failed: %s", exc)
             _send_done_card(
                 result,
                 text or "",
@@ -1830,39 +1945,8 @@ def _jenkins_watch_worker(
                 chat_id=target_chat,
                 reply_message_id=reply_mid,
                 vpn_mode=is_vpn_mode,
-                log_file_name=log_file_name if attach_log else None,
+                log_file_name=log_shown_name if attach_log else None,
             )
-            # The full console log as a downloadable {pipeline}.log, in the SAME thread as the
-            # card. Wrapped because everything below — the duty finish tag and the duty
-            # /updatemore callback — must run even if the upload blows up.
-            if attach_log:
-                attached = False
-                try:
-                    attached = _send_console_log_file(
-                        text or "",
-                        file_name=log_file_name,
-                        chat_id=target_chat,
-                        reply_message_id=reply_mid,
-                    )
-                except Exception as exc:
-                    logger.exception("console log attach step failed: %s", exc)
-                if not attached:
-                    # The card already said "(attached below)". Correct that rather than
-                    # leaving the reader waiting for a file that will never arrive.
-                    try:
-                        _emit_message(
-                            "text",
-                            {
-                                "text": (
-                                    f"⚠️ {log_file_name} 上传失败，完整日志请直接看 console："
-                                    f"{ctx['console_text_url']}"
-                                )
-                            },
-                            chat_id=target_chat,
-                            reply_message_id=reply_mid,
-                        )
-                    except Exception as exc:
-                        logger.exception("console log failure note failed: %s", exc)
             # VPN: the threaded card + .conf are enough — skip the plain "Done update…" line.
             if not is_vpn_mode:
                 _send_done_notify(
@@ -1890,6 +1974,39 @@ def _jenkins_watch_worker(
                     _handle_vpn_conf_after_success(result, job_base, build, meta)
                 except Exception as exc:
                     logger.exception("vpn conf handling failed: %s", exc)
+            # The COMPLETE console log as a downloadable {pipeline}.log, in the same thread as
+            # the card. Deliberately last: a 185 MB console can take minutes to gzip and
+            # upload, and the duty bot's /updatemore queue must not wait on that — it has a
+            # watchdog, and a queue parked at waiting_jenkins is the incident
+            # tests/test_watch_dedupe_and_notify_failures.py was written about.
+            if attach_log:
+                attached = False
+                try:
+                    attached = _send_console_log_file(
+                        text or "",
+                        file_name=log_file_name,
+                        chat_id=target_chat,
+                        reply_message_id=reply_mid,
+                    )
+                except Exception as exc:
+                    logger.exception("console log attach step failed: %s", exc)
+                if not attached:
+                    # The card already said "(attached below)". Correct that rather than
+                    # leaving the reader waiting for a file that will never arrive.
+                    try:
+                        _emit_message(
+                            "text",
+                            {
+                                "text": (
+                                    f"⚠️ {log_shown_name} 上传失败，完整日志请直接看 console："
+                                    f"{ctx['console_text_url']}"
+                                )
+                            },
+                            chat_id=target_chat,
+                            reply_message_id=reply_mid,
+                        )
+                    except Exception as exc:
+                        logger.exception("console log failure note failed: %s", exc)
             with _watch_meta_lock:
                 _watch_meta.pop((job_base, build), None)
             return
