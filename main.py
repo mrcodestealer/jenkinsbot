@@ -12,7 +12,7 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 import requests
 from flask import Flask, jsonify, request
@@ -241,6 +241,45 @@ except ValueError:
     POLL_SECONDS = 1.0
 
 STUCK_SECONDS = int(_env("JENKINS_STUCK_SECONDS") or "600")
+
+# ---- console-log delivery (done-card expand/collapse panel + .log attachment) ------------
+# Lark rejects a card whose whole REQUEST BODY exceeds 30 KB. The card JSON is escaped TWICE
+# on the way out — ``json.dumps(content_obj)`` in _send_chat_message_result /
+# _reply_in_thread_result, and then ``requests(json=body)`` escapes that string again — so a
+# newline costs 4 bytes and a CJK char 7. Never size the card dict; size the finished body.
+# 28000 is safely under both readings of "30 KB" (30000 and 30720).
+_CARD_BODY_LIMIT_BYTES = 28000
+
+# Room kept free for the "[… N earlier bytes omitted …]" marker, so prepending it cannot push
+# a capped .log back over the cap. At the documented 30 MB ceiling an overshoot is rejected by
+# Lark outright and no attachment arrives at all.
+_LOG_MARKER_RESERVE_BYTES = 256
+
+# Jenkins consoles carry ANSI colour from shell steps. Feishu renders the escapes as visible
+# garbage and they eat the byte budget, so they come out before the log is embedded.
+_ANSI_RE = re.compile(
+    # CSI — colours and cursor moves. ``:`` is in the parameter class because true colour is
+    # sometimes written ESC[38:2:R:G:Bm rather than with semicolons.
+    r"\x1b\[[0-9;:?]*[ -/]*[@-~]"
+    # OSC — window titles, hyperlinks.
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    # Charset designation. ``tput sgr0`` is ESC ( B ESC [ m on every xterm* TERM; without this
+    # the ESC is stripped by _LOG_CTRL_RE below and a stray "(B" survives as visible text.
+    r"|\x1b[()*+#][0-9A-Za-z]"
+    # Two-byte escapes carrying no payload (RIS, NEL, keypad modes, save/restore cursor).
+    r"|\x1b[=>78cDEHMZ]"
+)
+_LOG_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# A log line containing ``` would close our fence early and corrupt the rest of the card.
+_LOG_FENCE_RE = re.compile(r"`{3,}")
+_LOG_NAME_BAD_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+_WIN_RESERVED_NAMES = frozenset(
+    {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+)
 
 _FINISHED_RE = re.compile(
     r"Finished:\s*(SUCCESS|UNSTABLE|FAILURE|ABORTED)\s*$", re.MULTILINE
@@ -540,6 +579,183 @@ def _jenkins_console_text_url(job_base: str, build: int) -> str:
     return f"{job_base.rstrip('/')}/{build}/consoleText"
 
 
+def _env_flag(name: str, default: str = "1") -> bool:
+    """Optional boolean tunable. ``os.getenv``, never :func:`_env` — ``_env`` raises on a
+    missing key outside ``--testaccess``, and a new required key would break every caller
+    (including the test files, which seed only a fixed placeholder list)."""
+    raw = (os.getenv(name) or default).strip().lower()
+    return raw not in ("0", "false", "no", "off", "")
+
+
+def _log_card_max_bytes() -> int:
+    """Raw console bytes we are willing to *try* embedding in the done card.
+
+    Only a starting point — the real gate is the measured request-body size, because JSON
+    escaping inflates this by ~1.06x for a plain log and up to 2x for a log full of Windows
+    paths or embedded JSON."""
+    try:
+        return max(0, min(24000, int(os.getenv("JENKINS_LOG_CARD_MAX_BYTES", "18000"))))
+    except ValueError:
+        return 18000
+
+
+def _log_file_max_bytes() -> int:
+    """Cap on the uploaded ``.log``. Lark's own cap is 30 MB, but the upload blocks the
+    watcher thread and the duty callbacks sit downstream of it — so default far lower."""
+    try:
+        return max(
+            4096,
+            min(30 * 1024 * 1024, int(os.getenv("JENKINS_LOG_FILE_MAX_BYTES", "8388608"))),
+        )
+    except ValueError:
+        return 8 * 1024 * 1024
+
+
+def _log_file_enabled() -> bool:
+    return _env_flag("JENKINS_LOG_FILE_ENABLED", "1")
+
+
+def _log_panel_expanded() -> bool:
+    """``1`` opens the console panel on arrival instead of collapsed."""
+    return _env_flag("JENKINS_LOG_PANEL_EXPANDED", "0")
+
+
+def _log_panel_code_block() -> bool:
+    """Kill switch: no official doc example nests a fenced code block inside a collapsible
+    panel. Set ``0`` if it misrenders and the log falls back to plain markdown text."""
+    return _env_flag("JENKINS_LOG_PANEL_CODE_BLOCK", "1")
+
+
+def _console_wanted_for(result: str, *, vpn_mode: bool) -> bool:
+    """A **successful** ``vpn_conf`` build wants its ``.conf``, not a build log — its done
+    card has deliberately never carried console text, and a second file card in that thread is
+    noise. Every other outcome wants the log, including a FAILED vpn build (whose message today
+    only says 请检查 console)."""
+    return not (vpn_mode and (result or "").upper() == "SUCCESS")
+
+
+def _console_text_for_card(console_text: str) -> str:
+    """Make console output safe to embed: LF-only, no ANSI escapes, no stray control
+    characters, and no ``` run that could close our fence early."""
+    s = (console_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    s = _ANSI_RE.sub("", s)
+    s = _LOG_CTRL_RE.sub("", s)
+    return _LOG_FENCE_RE.sub(lambda m: "'" * len(m.group(0)), s)
+
+
+def _console_tail_bytes(text: str, max_bytes: int) -> Tuple[str, int]:
+    """Last ``max_bytes`` UTF-8 bytes of ``text``, re-aligned to a line boundary.
+
+    Tail rather than head: on a failed build the reason is at the end. Returns
+    ``(tail, dropped_bytes)``, where ``dropped_bytes`` is ``0`` when nothing was cut."""
+    raw = (text or "").encode("utf-8", errors="replace")
+    if max_bytes <= 0:
+        return "", len(raw)
+    if len(raw) <= max_bytes:
+        return text or "", 0
+    cut = raw[-max_bytes:].decode("utf-8", errors="ignore")
+    # Re-align to a line boundary, but only when it is cheap. When the window opens inside one
+    # very long line — a JSON dump, a base64 blob, a minified bundle — skipping to the first
+    # newline throws away almost the whole budget and leaves a two-line stub. Past a tenth of
+    # the window, keep the mid-line cut instead; the "earlier bytes omitted" marker the callers
+    # prepend already tells the reader the first line is partial.
+    nl = cut.find("\n")
+    if 0 <= nl < max(1, len(cut) // 10) and nl < len(cut) - 1:
+        cut = cut[nl + 1 :]
+    return cut, len(raw) - len(cut.encode("utf-8"))
+
+
+def _safe_log_filename(pipeline: str, build: int) -> str:
+    """``{pipeline}.log``, safe for Windows, POSIX and Lark's ``file_name`` field.
+
+    ``ctx["pipeline"]`` is the raw, never-percent-decoded last ``/job/<seg>`` segment
+    (:func:`_job_path_segments` -> :func:`_pipeline_and_env_from_segments`) and is the literal
+    string ``"unknown"`` when the URL carried no ``/job/`` segment — so decode, scrub, and
+    always keep a fallback."""
+    stem = unquote(str(pipeline or "")).strip()
+    stem = _LOG_NAME_BAD_RE.sub("_", stem)  # after unquote, so %2F -> / -> _
+    stem = re.sub(r"\s+", "_", stem)
+    stem = re.sub(r"_{2,}", "_", stem).strip("._ ")
+    if len(stem) > 80:
+        stem = stem[:80].rstrip("._ ")
+    if stem.upper() in _WIN_RESERVED_NAMES:
+        stem = f"{stem}_job"
+    if not stem or stem.lower() == "unknown":
+        stem = f"console-{build}"
+    return f"{stem}.log"
+
+
+def _card_request_bytes(
+    card: Dict[str, Any], *, chat_id: str, reply_message_id: Optional[str] = None
+) -> int:
+    """Size of the finished HTTP body, built exactly the way the senders build it.
+
+    :func:`_emit_message_result` may use the reply endpoint or the chat endpoint (it falls
+    back), so take the larger of the two shapes. Leaving ``ensure_ascii`` at its default on
+    both dumps is deliberate — that is what the real senders do, and it is what makes a CJK
+    character cost 7 bytes."""
+    inner = json.dumps(card)
+    sizes = [
+        len(
+            json.dumps(
+                {
+                    "receive_id": chat_id or "",
+                    "msg_type": "interactive",
+                    "content": inner,
+                }
+            ).encode("utf-8")
+        )
+    ]
+    if (reply_message_id or "").strip():
+        sizes.append(
+            len(
+                json.dumps(
+                    {
+                        "content": inner,
+                        "msg_type": "interactive",
+                        "reply_in_thread": True,
+                    }
+                ).encode("utf-8")
+            )
+        )
+    return max(sizes)
+
+
+def _console_panel_element(log_body: str, *, title: str) -> Dict[str, Any]:
+    """Card JSON 1.0 ``collapsible_panel`` holding the console log — the expand/hide block.
+
+    Stays on card JSON **1.0** on purpose: ``collapsible_panel`` is documented for 1.0 and
+    needs client V7.9, a *lower* floor than card JSON 2.0 itself (V7.20), so this is the
+    conservative option rather than the risky one.
+
+    The log sits in a ``markdown`` component, **not** a ``div``/``lark_md`` text element —
+    fenced code blocks only render in the former."""
+    # rstrip so a log ending in a newline does not leave a blank line inside the fence.
+    fenced = (log_body or "").rstrip()
+    content = f"```\n{fenced}\n```" if _log_panel_code_block() else log_body
+    return {
+        "tag": "collapsible_panel",
+        "expanded": _log_panel_expanded(),
+        "header": {
+            "title": {"tag": "markdown", "content": title},
+            "vertical_align": "center",
+            "padding": "4px 0px 4px 8px",
+            "icon": {
+                "tag": "standard_icon",
+                "token": "down-small-ccm_outlined",
+                "size": "16px 16px",
+            },
+            "icon_position": "follow_text",
+            "icon_expanded_angle": -180,
+        },
+        "border": {"color": "grey", "corner_radius": "5px"},
+        # 1.0 documents the default as 8px and 2.0 as 12px — pin it so it cannot drift.
+        "vertical_spacing": "8px",
+        "padding": "8px 8px 8px 8px",
+        "elements": [{"tag": "markdown", "content": content}],
+    }
+
+
 def _console_last_lines(console_text: str, *, max_lines: int = 10) -> str:
     lines = (console_text or "").replace("\r\n", "\n").split("\n")
     while lines and not lines[-1].strip():
@@ -561,7 +777,15 @@ def _send_done_card(
     chat_id: Optional[str] = None,
     reply_message_id: Optional[str] = None,
     vpn_mode: bool = False,
+    log_file_name: Optional[str] = None,
 ) -> None:
+    """Post the finish card. ``console_tail`` is the FULL console text.
+
+    The console goes into a ``collapsible_panel`` — an expand/hide block — rather than the old
+    fixed last-10-lines snippet, so the whole log is reachable inside the card. The card is
+    then shrunk down a ladder until the finished request body fits Lark's 30 KB cap, and the
+    complete log always also goes out as ``log_file_name`` (see :func:`_send_console_log_file`),
+    so a truncated embed is never a lost log."""
     target_chat = (chat_id or "").strip() or NOTIFY_CHAT_ID
     template = "green"
     if result == "FAILURE":
@@ -572,60 +796,104 @@ def _send_done_card(
         template = "grey"
 
     at = _tag_user_at_card()
+    show_console = _console_wanted_for(result, vpn_mode=vpn_mode)
     if vpn_mode:
         summary = (
-            "**done created vpn**"
-            if result == "SUCCESS"
-            else f"**VPN build {result}**"
-        )
-        body = (
-            f"{at}\n{summary}\n\n"
-            f"- **Environment：** {environment}\n"
-            f"- **Pipeline：** {pipeline}\n"
-            f"- **Build：** #{build}\n"
-            f"- **状态：** {result}\n"
-            f"- **链接：** {build_url}\n"
-            f"- **Logs :** {console_text_url}"
+            "**done created vpn**" if result == "SUCCESS" else f"**VPN build {result}**"
         )
     else:
-        tail = _console_last_lines(console_tail, max_lines=10)
-        body = (
-            f"{at}\n**done update kindly check**\n\n"
-            f"- **Environment：** {environment}\n"
-            f"- **Pipeline：** {pipeline}\n"
-            f"- **Build：** #{build}\n"
-            f"- **状态：** {result}\n"
-            f"- **链接：** {build_url}\n"
-            f"- **Logs :** {console_text_url}\n\n"
-            f"```\n{tail}\n```"
-        )
-    card = {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "template": template,
-            "title": {
-                "tag": "plain_text",
-                "content": (
-                    f"Jenkins Finished: {result} | {environment} / {pipeline}"
-                ),
-            },
-        },
-        "elements": [
-            {
-                "tag": "div",
-                "text": {
-                    "tag": "lark_md",
-                    "content": body,
+        summary = "**done update kindly check**"
+
+    lines = [
+        f"{at}\n{summary}\n",
+        f"- **Environment：** {environment}",
+        f"- **Pipeline：** {pipeline}",
+        f"- **Build：** #{build}",
+        f"- **状态：** {result}",
+        f"- **链接：** {build_url}",
+        f"- **Logs :** {console_text_url}",
+    ]
+    if log_file_name:
+        lines.append(f"- **Full log :** {log_file_name} (attached below)")
+    body = "\n".join(lines)
+
+    clean = _console_text_for_card(console_tail) if show_console else ""
+    total_bytes = len(clean.encode("utf-8")) if clean else 0
+
+    def _card_for(embed_bytes: int) -> Tuple[Dict[str, Any], int, int]:
+        elements: List[Dict[str, Any]] = [
+            {"tag": "div", "text": {"tag": "lark_md", "content": body}}
+        ]
+        embedded = 0
+        if clean.strip() and embed_bytes > 0:
+            try:
+                tail, dropped = _console_tail_bytes(clean, embed_bytes)
+                if tail.strip():
+                    if dropped:
+                        note = (
+                            f" — full log attached as {log_file_name}"
+                            if log_file_name
+                            else ""
+                        )
+                        title = (
+                            f"**Console log** — last {len(tail.encode('utf-8'))} "
+                            f"of {total_bytes} bytes"
+                        )
+                        tail = f"[… {dropped} earlier bytes omitted{note} …]\n{tail}"
+                    else:
+                        title = f"**Console log** — {total_bytes} bytes (complete)"
+                    elements.append(_console_panel_element(tail, title=title))
+                    embedded = len(tail.encode("utf-8"))
+            except Exception as exc:
+                # A panel-building bug must never cost us the done card itself.
+                logger.exception("console panel build failed: %s", exc)
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": template,
+                "title": {
+                    "tag": "plain_text",
+                    "content": f"Jenkins Finished: {result} | {environment} / {pipeline}",
                 },
-            }
-        ],
-    }
+            },
+            "elements": elements,
+        }
+        size = _card_request_bytes(
+            card, chat_id=target_chat, reply_message_id=reply_message_id
+        )
+        return card, size, embedded
+
+    # Shrink ladder. A 500 KB console NEVER produces a failed send: the last rung embeds
+    # nothing at all, and the full log goes out as the .log attachment regardless.
+    budget = _log_card_max_bytes()
+    ladder = sorted(
+        {b for b in (budget, 12000, 6000, 3000, 1000, 0) if b <= budget}, reverse=True
+    ) or [0]
+    for step in ladder:
+        card, size, embedded = _card_for(step)
+        if size <= _CARD_BODY_LIMIT_BYTES:
+            break
+    else:
+        # Oversized even with no log embedded — the summary itself is pathological (a
+        # multi-KB pipeline or environment string). Nothing left to shrink, so send it and
+        # let the API answer. The .log is a separate message and is unaffected.
+        logger.error(
+            "done card is %s bytes with no log embed — sending anyway result=%s pipeline=%s",
+            size,
+            result,
+            pipeline,
+        )
+
     ok = _emit_message(
         "interactive", card, chat_id=target_chat, reply_message_id=reply_message_id
     )
     logger.info(
-        "send_done_card interactive ok=%s result=%s env=%s pipeline=%s build=%s chat=%s thread=%s",
+        "send_done_card interactive ok=%s bytes=%s log_embed=%s/%s result=%s env=%s "
+        "pipeline=%s build=%s chat=%s thread=%s",
         ok,
+        size,
+        embedded,
+        total_bytes,
         result,
         environment,
         pipeline,
@@ -1307,7 +1575,9 @@ def _download_artifact(
         return False
 
 
-def _upload_file_lark(path: str, file_name: str) -> Optional[str]:
+def _upload_file_lark(
+    path: str, file_name: str, *, timeout: int = 120
+) -> Optional[str]:
     token = _get_tenant_access_token()
     if not token:
         return None
@@ -1320,7 +1590,7 @@ def _upload_file_lark(path: str, file_name: str) -> Optional[str]:
                 "file_name": (None, file_name),
                 "file": (file_name, fh, "application/octet-stream"),
             }
-            resp = requests.post(url, headers=headers, files=files, timeout=120)
+            resp = requests.post(url, headers=headers, files=files, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
@@ -1330,6 +1600,82 @@ def _upload_file_lark(path: str, file_name: str) -> Optional[str]:
         logger.error("upload_file_lark API error: %s", data)
         return None
     return (data.get("data") or {}).get("file_key")
+
+
+def _send_console_log_file(
+    console_text: str,
+    *,
+    file_name: str,
+    chat_id: str,
+    reply_message_id: Optional[str] = None,
+) -> bool:
+    """Upload the full console log and post it as a clickable ``file`` message in the card's
+    own thread.
+
+    **Never raises.** The duty-bot callbacks in :func:`_jenkins_watch_worker` run downstream of
+    this call, and an escaping exception would park an ``/updatemore`` queue at
+    ``waiting_jenkins`` forever — the incident ``tests/test_watch_dedupe_and_notify_failures.py``
+    was written about.
+
+    Uses :func:`_emit_message`, not :func:`_send_file_message`: the latter routes to
+    ``_send_chat_message`` (chat_id only), which would drop the attachment into the chat root
+    while the done card sits in the thread."""
+    try:
+        text = console_text or ""
+        if not text.strip():
+            logger.info("console log attach skipped: empty log file=%s", file_name)
+            return False  # Lark rejects an empty upload outright
+        cap = _log_file_max_bytes()
+        body, dropped = _console_tail_bytes(
+            text, max(1024, cap - _LOG_MARKER_RESERVE_BYTES)
+        )
+        if dropped:
+            body = (
+                f"[… {dropped} earlier bytes omitted — log exceeded "
+                f"JENKINS_LOG_FILE_MAX_BYTES={cap} …]\n"
+            ) + body
+        tmpdir = tempfile.mkdtemp(prefix="jenkinslog_")
+        try:
+            dest = os.path.join(tmpdir, file_name)
+            # _fetch_console_text decodes via r.apparent_encoding, so pin utf-8 on the way
+            # out. newline="" stops Windows rewriting every \n to \r\n in a log that may
+            # already carry CRLF.
+            with open(dest, "w", encoding="utf-8", errors="replace", newline="") as fh:
+                fh.write(body)
+            size = os.path.getsize(dest)
+            if size <= 0:
+                logger.warning("console log attach skipped: 0 bytes file=%s", file_name)
+                return False
+            file_key = _upload_file_lark(dest, file_name, timeout=60)
+            if not file_key:
+                logger.error(
+                    "console log upload FAILED file=%s bytes=%s chat=%s — the done card and "
+                    "the duty callbacks are unaffected",
+                    file_name,
+                    size,
+                    chat_id,
+                )
+                return False
+            ok = _emit_message(
+                "file",
+                {"file_key": file_key},
+                chat_id=chat_id,
+                reply_message_id=reply_message_id,
+            )
+            logger.info(
+                "console log attached ok=%s file=%s bytes=%s chat=%s thread=%s",
+                ok,
+                file_name,
+                size,
+                chat_id,
+                bool((reply_message_id or "").strip()),
+            )
+            return ok
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    except Exception as exc:
+        logger.exception("console log attach failed: %s", exc)
+        return False
 
 
 def _send_file_message(chat_id: str, file_key: str) -> bool:
@@ -1466,6 +1812,13 @@ def _jenkins_watch_worker(
                 ctx["environment"],
                 ctx["pipeline"],
             )
+            try:
+                log_file_name = _safe_log_filename(ctx["pipeline"], build)
+            except Exception:
+                log_file_name = f"console-{build}.log"
+            attach_log = _log_file_enabled() and _console_wanted_for(
+                result, vpn_mode=is_vpn_mode
+            )
             _send_done_card(
                 result,
                 text or "",
@@ -1477,7 +1830,39 @@ def _jenkins_watch_worker(
                 chat_id=target_chat,
                 reply_message_id=reply_mid,
                 vpn_mode=is_vpn_mode,
+                log_file_name=log_file_name if attach_log else None,
             )
+            # The full console log as a downloadable {pipeline}.log, in the SAME thread as the
+            # card. Wrapped because everything below — the duty finish tag and the duty
+            # /updatemore callback — must run even if the upload blows up.
+            if attach_log:
+                attached = False
+                try:
+                    attached = _send_console_log_file(
+                        text or "",
+                        file_name=log_file_name,
+                        chat_id=target_chat,
+                        reply_message_id=reply_mid,
+                    )
+                except Exception as exc:
+                    logger.exception("console log attach step failed: %s", exc)
+                if not attached:
+                    # The card already said "(attached below)". Correct that rather than
+                    # leaving the reader waiting for a file that will never arrive.
+                    try:
+                        _emit_message(
+                            "text",
+                            {
+                                "text": (
+                                    f"⚠️ {log_file_name} 上传失败，完整日志请直接看 console："
+                                    f"{ctx['console_text_url']}"
+                                )
+                            },
+                            chat_id=target_chat,
+                            reply_message_id=reply_mid,
+                        )
+                    except Exception as exc:
+                        logger.exception("console log failure note failed: %s", exc)
             # VPN: the threaded card + .conf are enough — skip the plain "Done update…" line.
             if not is_vpn_mode:
                 _send_done_notify(
