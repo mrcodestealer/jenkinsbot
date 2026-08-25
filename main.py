@@ -254,6 +254,21 @@ _VPN_TRAILING_NUM_RE = re.compile(r"(\d+)\s*$")
 _watch_meta_lock = threading.Lock()
 _watch_meta: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
+# Watchers currently running, keyed ``(job_base, build, mode)``. Guarded by ``_watch_meta_lock``.
+#
+# Two watchers on one build finish together and each fires the duty notification, so the duty bot
+# gets the same ``/SuccessProceedNext`` twice and advances its queue past a segment that has not
+# built yet — the failure this file already describes at the websocket dedupe. That dedupe only
+# stops a REDELIVERY of one event; two genuinely distinct inform messages for the same build (a
+# re-send, a retry, the same link pasted twice) still started two threads, because
+# ``_start_jenkins_watch_from_url`` had no such check at all.
+#
+# ``mode`` is part of the key on purpose. Deduping on ``(job_base, build)`` alone would silently
+# drop a watch whose mode differs from the one already running — and dropping an ``inform_time``
+# watch means the customer's done-reply email never goes out. Same build AND same mode is a
+# genuine duplicate; a different mode is a different job to do.
+_active_watches: set = set()
+
 _vpn_find_sessions_lock = threading.Lock()
 _vpn_find_sessions: Dict[str, Dict[str, Any]] = {}
 _vpn_find_picker_sids: Dict[str, str] = {}
@@ -1125,7 +1140,19 @@ def _notify_duty_after_inform_watch(
         if _notify_duty_updatemore_callback_http("/FailedStop", duty_chat):
             logger.info("duty bot notified via HTTP for /FailedStop chat=%s", duty_chat)
             return
-        _send_duty_text("/FailedStop", duty_chat)
+        if not _send_duty_text("/FailedStop", duty_chat):
+            # A dropped /FailedStop is worse than a dropped proceed: the queue stays parked
+            # waiting for a build that already failed, so the run neither advances nor stops.
+            logger.error(
+                "duty notify FAILED for /FailedStop chat=%s — a failed build was not reported, "
+                "so an /updatemore queue may sit waiting on it",
+                duty_chat,
+            )
+            _send_chat_message(
+                duty_chat,
+                "text",
+                {"text": "⚠️ Build FAILED and I could not reach the duty bot for `/FailedStop`"},
+            )
         return
     if meta.get("mode") == "inform_time":
         title = (meta.get("email_title") or "").strip()
@@ -1148,12 +1175,33 @@ def _notify_duty_after_inform_watch(
         if _notify_duty_updatemore_callback_http("/SuccessProceedNext", duty_chat):
             logger.info("duty bot notified via HTTP for /SuccessProceedNext chat=%s", duty_chat)
             return
+        # A 409 here is the duty bot saying "no queue of mine claimed this", which is normal for a
+        # run that was never part of an /updatemore. Say so at INFO so the Lark attempt below is
+        # not read as a malfunction.
+        logger.info(
+            "duty HTTP did not claim /SuccessProceedNext (chat=%s) — falling back to Lark",
+            duty_chat,
+        )
         if not _send_duty_text("/SuccessProceedNext", duty_chat):
-            _send_chat_message(
+            # Both sends inside _send_duty_text failed. That used to end here: the only trace was
+            # whatever _send_chat_message logged one frame down, and if the warning below ALSO
+            # failed to send, the whole notification vanished with no record that it was even
+            # attempted. An unreachable duty bot must never be silent.
+            logger.error(
+                "duty notify FAILED for /SuccessProceedNext chat=%s — Lark send did not go "
+                "through; the update queue (if any) will NOT advance on its own",
+                duty_chat,
+            )
+            if not _send_chat_message(
                 duty_chat,
                 "text",
                 {"text": "⚠️ Could not reach duty bot for `/SuccessProceedNext`"},
-            )
+            ):
+                logger.error(
+                    "duty notify warning could not be posted either chat=%s — this build's "
+                    "completion reached nobody",
+                    duty_chat,
+                )
 
 
 def _vpn_trailing_number(location: str) -> str:
@@ -1537,17 +1585,39 @@ def _start_jenkins_watch_from_url(
     watch_meta = dict(meta) if isinstance(meta, dict) else {}
     watch_meta["_jenkins_auth"] = auth
 
+    # Claim this (build, mode) BEFORE starting the thread. Registering afterwards — which is what
+    # the ``_watch_meta`` write below used to do on its own — leaves a window in which a second
+    # inform for the same build sees nothing registered and starts its own watcher.
+    watch_key = (job_base, build, str(watch_meta.get("mode") or ""))
+    with _watch_meta_lock:
+        if watch_key in _active_watches:
+            logger.info(
+                "jenkins watch already running for %s #%s mode=%r — not starting a second "
+                "(a duplicate would fire the duty notification twice and advance its queue "
+                "past a segment that has not built)",
+                job_base, build, watch_key[2],
+            )
+            return "ok", build, pipeline, path_env
+        _active_watches.add(watch_key)
+        if isinstance(meta, dict) and meta.get("mode"):
+            _watch_meta[(job_base, build)] = dict(meta)
+
+    def _guarded_watch() -> None:
+        # The worker returns from several places inside its poll loop, so the release lives here
+        # rather than in its control flow: a watcher that ends any other way (stuck, exception,
+        # loop exit) must still free its slot, or that build can never be watched again.
+        try:
+            _jenkins_watch_worker(job_base, build, meta=watch_meta)
+        finally:
+            with _watch_meta_lock:
+                _active_watches.discard(watch_key)
+
     t = threading.Thread(
-        target=_jenkins_watch_worker,
-        args=(job_base, build),
-        kwargs={"meta": watch_meta},
+        target=_guarded_watch,
         daemon=True,
         name=f"jenkins-watch-{build}",
     )
     t.start()
-    if isinstance(meta, dict) and meta.get("mode"):
-        with _watch_meta_lock:
-            _watch_meta[(job_base, build)] = dict(meta)
     return "ok", build, pipeline, path_env
 
 
