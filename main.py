@@ -544,6 +544,100 @@ def _add_message_reaction(message_id: str, emoji_type: str = "OK") -> bool:
     return False
 
 
+def _add_message_reaction_id(message_id: str, emoji_type: str) -> Optional[str]:
+    """Add one reaction; return its ``reaction_id``, which is the ONLY way to remove it later.
+
+    ``DELETE .../reactions/{reaction_id}`` takes the opaque id from this call — there is no
+    "remove by emoji_type" endpoint — so a caller that wants to un-react has to keep this.
+    Returns ``None`` on failure; never raises. An invalid ``emoji_type`` comes back as 231001,
+    and a bot that is not a member of the chat gets 231002."""
+    mid = (message_id or "").strip()
+    et = (emoji_type or "").strip()
+    if not mid or not et:
+        return None
+    token = _get_tenant_access_token()
+    if not token:
+        return None
+    url = f"{_lark_open_base()}/open-apis/im/v1/messages/{mid}/reactions"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    try:
+        resp = requests.post(
+            url, headers=headers, json={"reaction_type": {"emoji_type": et}}, timeout=10
+        )
+        data = resp.json() if resp.content else {}
+    except Exception as exc:
+        logger.warning("reaction add %s failed: %s", et, exc)
+        return None
+    if resp.status_code == 200 and data.get("code") == 0:
+        rid = str((data.get("data") or {}).get("reaction_id") or "").strip()
+        return rid or None
+    logger.warning(
+        "reaction add %s rejected status=%s code=%s msg=%s",
+        et,
+        resp.status_code,
+        data.get("code"),
+        str(data.get("msg"))[:120],
+    )
+    return None
+
+
+def _remove_message_reaction(message_id: str, reaction_id: str) -> bool:
+    """Remove a reaction this bot added. A bot may only delete its own (else 231007)."""
+    mid = (message_id or "").strip()
+    rid = (reaction_id or "").strip()
+    if not mid or not rid:
+        return False
+    token = _get_tenant_access_token()
+    if not token:
+        return False
+    url = f"{_lark_open_base()}/open-apis/im/v1/messages/{mid}/reactions/{rid}"
+    try:
+        resp = requests.delete(
+            url, headers={"Authorization": f"Bearer {token}"}, timeout=10
+        )
+        data = resp.json() if resp.content else {}
+    except Exception as exc:
+        logger.warning("reaction delete failed: %s", exc)
+        return False
+    if resp.status_code == 200 and data.get("code") == 0:
+        return True
+    logger.warning(
+        "reaction delete rejected status=%s code=%s msg=%s",
+        resp.status_code,
+        data.get("code"),
+        str(data.get("msg"))[:120],
+    )
+    return False
+
+
+def _react_emoji(name: str, default: str) -> str:
+    """Reaction emoji names are case-sensitive and the enum's casing is genuinely inconsistent
+    ("OnIt" is CamelCase, "DONE" is all-caps), so these are copied literally from Feishu's
+    表情文案说明 table rather than normalised. A wrong value is rejected with 231001."""
+    return (os.getenv(name) or "").strip() or default
+
+
+def _react_progress_start(message_id: str) -> Optional[str]:
+    """React 'working on it' and return the reaction_id needed to take it off again."""
+    return _add_message_reaction_id(message_id, _react_emoji("JENKINS_REACT_WORKING", "OnIt"))
+
+
+def _react_progress_end(message_id: str, working_id: Optional[str], *, ok: bool) -> None:
+    """Swap the in-progress reaction for a terminal one. Best effort: a missing reaction must
+    never be the reason a command reports failure."""
+    if working_id:
+        _remove_message_reaction(message_id, working_id)
+    emoji = (
+        _react_emoji("JENKINS_REACT_DONE", "DONE")
+        if ok
+        else _react_emoji("JENKINS_REACT_FAILED", "CrossMark")
+    )
+    _add_message_reaction_id(message_id, emoji)
+
+
 def _event_sender_open_id(event: Dict[str, Any]) -> str:
     sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
     sid = sender.get("sender_id")
@@ -552,8 +646,16 @@ def _event_sender_open_id(event: Dict[str, Any]) -> str:
     return (sender.get("open_id") or "").strip()
 
 
+# Received mentions arrive as "@_user_1", "@_user_2", ... — per-message ordinals, bots
+# included. "@_all" is not documented for the receive side; stripped defensively in case.
+_AT_PLACEHOLDER_RE = re.compile(r"@_(?:user_\d+|all)\b", re.IGNORECASE)
+
+
 def _strip_lark_mentions(text: str) -> str:
+    """Remove @ mentions in BOTH shapes: the ``<at ...></at>`` markup we SEND, and the
+    ``@_user_N`` placeholders Feishu substitutes into the messages we RECEIVE."""
     s = re.sub(r"<at[^>]*>.*?</at>", " ", text or "", flags=re.I)
+    s = _AT_PLACEHOLDER_RE.sub(" ", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
@@ -2303,7 +2405,12 @@ def internal_vpn_conf_deliver():
 # The command itself is fixed: no branch, remote, or flag is ever taken from chat, and nothing
 # is run through a shell, so there is no injection surface.
 _DEPLOY_CMD_RE = re.compile(
-    r"""^\s*/?
+    r"""^\s*
+        # Tolerate a literal "@Bot Name " prefix, in case a client sends the display name
+        # rather than the documented @_user_N placeholder. Bounded to a few words, so this
+        # cannot degrade into "any leading text".
+        (?:@\S+(?:[ \t]+\S+){0,4}[ \t]+)?
+        \s*/?
         (?:git\s*pull|gitpull|deploy)
         (?:\s+origin)?(?:\s+main)?
         (?:\s*(?:and|&|\+|,|then|然后|并且|并|再)\s*)?
@@ -2418,6 +2525,11 @@ def _handle_deploy_command(
     if not _deploy_lock.acquire(blocking=False):
         _out("⏳ 已有一个部署在进行，忽略这次。")
         return
+    # React "working on it" now, and swap it for DONE / CrossMark once the outcome is known.
+    # Both happen BEFORE the restart: a restart kills this process, and anything not yet sent
+    # never gets sent.
+    working = _react_progress_start(message_id)
+    ok = False
     try:
         repo = _deploy_repo_dir()
         unit = _deploy_service_name()
@@ -2450,9 +2562,15 @@ def _handle_deploy_command(
         _out("\n".join(lines))
 
         logger.warning("DEPLOY pull rc=%s by=%s head=%r", rc, who, head[:120])
+        _react_progress_end(message_id, working, ok=ok)
+        working = None
         if ok and opts.get("restart"):
             _restart_own_service(unit)
     finally:
+        if working:
+            # Something threw between the two reactions. Do not leave "working on it" stuck on
+            # the message forever — that reads as a deploy that never finished.
+            _react_progress_end(message_id, working, ok=False)
         _deploy_lock.release()
 
 

