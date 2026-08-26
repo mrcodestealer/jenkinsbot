@@ -214,6 +214,24 @@ TAG_USER_OPEN_ID = (
 # message carrying a slash command — those are addressed to the bot, never to a person.
 DUTY_BOT_OPEN_ID = (os.getenv("DUTY_BOT_OPEN_ID") or "ou_1f6596a9923a2a835918e7e2513595d5").strip()
 
+# Say out loud, at boot, which ids the @mentions will actually use and whether each came from the
+# environment or from a built-in fallback.
+#
+# Every open_id bug in this project was invisible: a wrong id renders as *some* name, the duty
+# command works untagged anyway, and nothing fails — so "@OSE BOT /SuccessProceedNext" looked
+# plausible for as long as nobody compared it against a probe. Worse, these are read ONCE at
+# import, so an edited .env changes nothing until a restart, and a variable already present in the
+# process environment (systemd ``Environment=``) silently beats the .env file because
+# ``_load_dotenv`` only fills keys that are not already set. One log line answers all of that.
+for _id_name, _id_val, _id_fallback in (
+    ("DUTY_BOT_OPEN_ID (duty commands -> the UPDATE bot)", DUTY_BOT_OPEN_ID,
+     "ou_1f6596a9923a2a835918e7e2513595d5"),
+    ("TAG_USER_OPEN_ID (human done/stuck notices)", TAG_USER_OPEN_ID,
+     "ou_d7bc33724e2d6ced4050c944c2ca5650"),
+):
+    _src = "BUILT-IN FALLBACK — probably wrong for this tenant" if _id_val == _id_fallback else "from env"
+    logger.info("@mention target %s = %s (%s)", _id_name, _id_val or "(unset)", _src)
+
 
 def _at_mention_card(open_id: str) -> str:
     """``lark_md`` in interactive cards — ``<at id=ou_…></at>``."""
