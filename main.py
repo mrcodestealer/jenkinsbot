@@ -544,6 +544,13 @@ def _add_message_reaction(message_id: str, emoji_type: str = "OK") -> bool:
     return False
 
 
+# Why the last reaction attempt failed, in a form worth showing a human. Same pattern as
+# _last_probe_detail: a reaction that fails silently is indistinguishable from a bot that
+# ignored you, and the usual cause (a missing im:message.reactions:write_only scope) is
+# invisible unless somebody reads the log.
+_last_reaction_error: str = ""
+
+
 def _add_message_reaction_id(message_id: str, emoji_type: str) -> Optional[str]:
     """Add one reaction; return its ``reaction_id``, which is the ONLY way to remove it later.
 
@@ -551,12 +558,16 @@ def _add_message_reaction_id(message_id: str, emoji_type: str) -> Optional[str]:
     "remove by emoji_type" endpoint — so a caller that wants to un-react has to keep this.
     Returns ``None`` on failure; never raises. An invalid ``emoji_type`` comes back as 231001,
     and a bot that is not a member of the chat gets 231002."""
+    global _last_reaction_error
+    _last_reaction_error = ""
     mid = (message_id or "").strip()
     et = (emoji_type or "").strip()
     if not mid or not et:
+        _last_reaction_error = f"no message_id or emoji (mid={mid!r} emoji={et!r})"
         return None
     token = _get_tenant_access_token()
     if not token:
+        _last_reaction_error = "could not get a tenant_access_token"
         return None
     url = f"{_lark_open_base()}/open-apis/im/v1/messages/{mid}/reactions"
     headers = {
@@ -569,18 +580,29 @@ def _add_message_reaction_id(message_id: str, emoji_type: str) -> Optional[str]:
         )
         data = resp.json() if resp.content else {}
     except Exception as exc:
+        _last_reaction_error = f"{type(exc).__name__}: {exc}"
         logger.warning("reaction add %s failed: %s", et, exc)
         return None
     if resp.status_code == 200 and data.get("code") == 0:
         rid = str((data.get("data") or {}).get("reaction_id") or "").strip()
-        return rid or None
-    logger.warning(
-        "reaction add %s rejected status=%s code=%s msg=%s",
-        et,
-        resp.status_code,
-        data.get("code"),
-        str(data.get("msg"))[:120],
+        if rid:
+            return rid
+        _last_reaction_error = "the API returned no reaction_id"
+        return None
+    code = data.get("code")
+    hint = {
+        231001: "emoji_type 不合法（大小写敏感，例如 OnIt / DONE）",
+        231002: "机器人没有权限给这条消息加表情 —— 通常是机器人不在这个会话里",
+        231003: "消息不存在或已被撤回",
+        231008: "机器人无权访问这条消息",
+        231017: "这种消息类型不支持表情回复",
+        99991672: "缺少权限 im:message 或 im:message.reactions:write_only（去开放平台给应用开通并发版）",
+    }.get(code, "")
+    _last_reaction_error = (
+        f"emoji={et} HTTP {resp.status_code} code={code} {str(data.get('msg'))[:120]}"
+        + (f" — {hint}" if hint else "")
     )
+    logger.warning("reaction add rejected: %s", _last_reaction_error)
     return None
 
 
@@ -2499,13 +2521,75 @@ def _restart_own_service(unit: str) -> None:
     threading.Timer(2.0, lambda: os._exit(3)).start()
 
 
+_PING_CMD_RE = re.compile(
+    r"""^\s*
+        (?:@\S+(?:[ \t]+\S+){0,4}[ \t]+)?
+        \s*/?
+        (?:ping|diag|status|version|health)
+        \s*[.!?。！]*\s*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _parse_ping_command(text: str) -> bool:
+    """``@bot ping`` — answer "is the new code even running, and can you react?" in the chat.
+
+    Exists because the alternative is another round of "it didn't do anything": a stale
+    checkout, an unset allowlist and a missing reaction scope all look identical from the
+    outside, and only one of them writes anything a user can see."""
+    clean = _strip_lark_mentions(text or "")
+    return bool(clean) and bool(_PING_CMD_RE.match(clean))
+
+
+def _handle_ping_command(*, chat_id: str, message_id: str, sender_id: str) -> None:
+    who = (sender_id or "").strip()
+    repo = _deploy_repo_dir()
+    _, head = _run_cmd(["git", "-C", repo, "log", "-1", "--pretty=%h %cs %s"], 20)
+    _, branch = _run_cmd(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"], 20)
+    allowed = _deploy_allowed_open_ids()
+
+    # Live reaction test: add one and take it straight back off, so the answer is what the API
+    # actually does right now rather than what the config implies.
+    rid = _add_message_reaction_id(message_id, _react_emoji("JENKINS_REACT_WORKING", "OnIt"))
+    react_line = "✅ 可以加表情" if rid else f"❌ 不能加表情 — {_last_reaction_error}"
+    if rid:
+        _remove_message_reaction(message_id, rid)
+
+    lines = [
+        "**jenkinsbot ping**",
+        f"- 代码：{head or '(git 不可用)'}",
+        f"- 分支：{branch or '?'}",
+        f"- 目录：{repo}",
+        f"- 表情回复：{react_line}",
+        f"- 部署命令：{'✅ 已启用' if allowed else '❌ 未启用（DEPLOY_ALLOWED_OPEN_IDS 为空）'}",
+        f"- 你的 open_id：{who or '(未知)'}"
+        + ("（在允许名单里）" if who and who in allowed else "（不在允许名单里）" if allowed else ""),
+        f"- 服务名：{_deploy_service_name()}.service",
+    ]
+    text = "\n".join(lines)
+    if not _reply_in_thread_message(message_id, "text", {"text": text}):
+        _send_chat_message(chat_id or NOTIFY_CHAT_ID, "text", {"text": text})
+    logger.info("ping answered for %s head=%r react_ok=%s", who or "?", head[:80], bool(rid))
+
+
 def _handle_deploy_command(
     opts: Dict[str, Any], *, chat_id: str, message_id: str, sender_id: str
 ) -> None:
     who = (sender_id or "").strip()
     allowed = _deploy_allowed_open_ids()
 
+    # React the MOMENT the command is recognised — before the permission checks, not after.
+    # Putting this behind the allowlist meant the common case (allowlist not configured yet)
+    # replied with a refusal and never reacted at all, which reads exactly like the bot never
+    # saw the message. Every exit below swaps this for DONE or CrossMark.
+    working = _react_progress_start(message_id)
+    react_err = "" if working else _last_reaction_error
+
     def _out(text: str) -> None:
+        # A reaction that silently fails is indistinguishable from a bot that ignored you, so
+        # when the reaction did not land, say why in the reply itself.
+        if react_err:
+            text = f"{text}\n\n⚠️ 表情回复失败：{react_err}"
         if not _reply_in_thread_message(message_id, "text", {"text": text}):
             _send_chat_message(chat_id or NOTIFY_CHAT_ID, "text", {"text": text})
 
@@ -2516,19 +2600,18 @@ def _handle_deploy_command(
             "在 .env 加一行再重启一次服务即可启用：\n"
             f"DEPLOY_ALLOWED_OPEN_IDS={who or 'ou_你的open_id'}"
         )
+        _react_progress_end(message_id, working, ok=False)
         return
     if who not in allowed:
         logger.warning("deploy DENIED sender=%s not in allowlist", who or "?")
         _out(f"⚠️ 你没有部署权限。你的 open_id：{who or '(未知)'}")
+        _react_progress_end(message_id, working, ok=False)
         return
 
     if not _deploy_lock.acquire(blocking=False):
         _out("⏳ 已有一个部署在进行，忽略这次。")
+        _react_progress_end(message_id, working, ok=False)
         return
-    # React "working on it" now, and swap it for DONE / CrossMark once the outcome is known.
-    # Both happen BEFORE the restart: a restart kills this process, and anything not yet sent
-    # never gets sent.
-    working = _react_progress_start(message_id)
     ok = False
     try:
         repo = _deploy_repo_dir()
@@ -2581,6 +2664,14 @@ def _process_message_command(
     Lark gets a fast 200 and does not retry (retries previously caused minutes-long delays)."""
     try:
         chat_id = event_chat_id or NOTIFY_CHAT_ID
+
+        if _parse_ping_command(text):
+            _handle_ping_command(
+                chat_id=chat_id,
+                message_id=(message_id or "").strip(),
+                sender_id=sender_id,
+            )
+            return
 
         deploy = _parse_deploy_command(text)
         if deploy is not None:

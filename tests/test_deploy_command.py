@@ -463,16 +463,68 @@ def test_the_done_reaction_is_applied_before_the_restart() -> None:
     check(i_end < i_restart, "the terminal reaction goes on before the restart is requested")
 
 
-def test_an_unauthorised_call_reacts_nothing() -> None:
-    """No reaction either — an unauthorised message should not look like it was picked up."""
+def test_every_recognised_command_reacts_even_when_refused() -> None:
+    """The reaction goes on BEFORE the permission checks, not after.
+
+    Putting it after was a real bug: the default state is an unset allowlist, so the common case
+    replied with a refusal and never reacted at all — indistinguishable from a bot that never saw
+    the message. Both refusal paths must still end in CrossMark, never in silence and never
+    leaving OnIt stuck on."""
+    # (a) allowlist not configured at all — the out-of-the-box state
+    with_allowlist(None)
+    with Run() as r:
+        jb._handle_deploy_command(
+            {"restart": True}, chat_id=CHAT, message_id=MSG, sender_id=ME
+        )
+    check(
+        [x[0] for x in r.reactions] == ["+", "-", "+"],
+        f"unset allowlist still reacts (got {r.reactions!r})",
+    )
+    if len(r.reactions) == 3:
+        check(r.reactions[0][2] == "OnIt", "starts with OnIt")
+        check(r.reactions[2][2] == "CrossMark", f"ends CrossMark (got {r.reactions[2][2]!r})")
+    check(r.cmds == [], "and still runs nothing")
+
+    # (b) allowlist set, wrong person
     with_allowlist(ME)
     try:
         with Run() as r:
             jb._handle_deploy_command(
                 {"restart": True}, chat_id=CHAT, message_id=MSG, sender_id=STRANGER
             )
-        check(r.reactions == [], f"no reaction on a denied command (got {r.reactions!r})")
+        check(
+            [x[0] for x in r.reactions] == ["+", "-", "+"]
+            and r.reactions[2][2] == "CrossMark",
+            f"a denied sender gets OnIt then CrossMark (got {r.reactions!r})",
+        )
+        check(r.cmds == [], "and still runs nothing")
     finally:
+        with_allowlist(None)
+
+
+def test_a_reaction_that_fails_is_said_out_loud() -> None:
+    """A missing im:message.reactions:write_only scope is invisible: the API rejects the
+    reaction, the bot logs a warning nobody reads, and the user sees a command that "didn't
+    react" with no reason given. Put the reason in the reply."""
+    with_allowlist(ME)
+    saved = jb._add_message_reaction_id
+    try:
+        def refuse(mid, emoji):
+            jb._last_reaction_error = "emoji=OnIt HTTP 403 code=99991672 no permission"
+            return None
+
+        jb._add_message_reaction_id = refuse
+        with Run(pull_rc=0) as r:
+            # Run's own stub is replaced by ours, so re-apply after entering.
+            jb._add_message_reaction_id = refuse
+            jb._handle_deploy_command(
+                {"restart": True}, chat_id=CHAT, message_id=MSG, sender_id=ME
+            )
+        check("表情回复失败" in r.text, f"the reply names the reaction failure (got {r.text[-200:]!r})")
+        check("99991672" in r.text, "and carries the API's own error code")
+        check(any("pull" in c for c in r.cmds), "the deploy itself still ran")
+    finally:
+        jb._add_message_reaction_id = saved
         with_allowlist(None)
 
 
@@ -524,6 +576,35 @@ def test_the_reaction_emoji_are_the_documented_case_sensitive_names() -> None:
         )
     finally:
         os.environ.pop("JENKINS_REACT_DONE", None)
+
+
+def test_ping_answers_the_did_it_even_load_question() -> None:
+    """The command that ends a "nothing happened" loop: a stale checkout, an unset allowlist and
+    a missing reaction scope all look identical from the outside. ping distinguishes them."""
+    for raw in ("ping", "@_user_1 ping", "/ping", "@_user_1 diag", "status", "@_user_1 version"):
+        check(jb._parse_ping_command(raw) is True, f"recognised: {raw!r}")
+    for raw in ("pinging the server", "what is the status of build 740?", "", "ping pong"):
+        check(jb._parse_ping_command(raw) is False, f"must NOT be ping: {raw!r}")
+
+    with_allowlist(ME)
+    try:
+        with Run() as r:
+            jb._handle_ping_command(chat_id=CHAT, message_id=MSG, sender_id=ME)
+        for probe in ("def5678", "表情回复", "部署命令", ME):
+            check(probe in r.text, f"ping reports {probe!r} (got {r.text[:300]!r})")
+        # It must ADD and then REMOVE its test reaction, leaving nothing behind.
+        check(
+            [x[0] for x in r.reactions] == ["+", "-"],
+            f"the live reaction test cleans up after itself (got {r.reactions!r})",
+        )
+    finally:
+        with_allowlist(None)
+
+    # And with the allowlist off it must say so, since that is the usual cause.
+    with_allowlist(None)
+    with Run() as r:
+        jb._handle_ping_command(chat_id=CHAT, message_id=MSG, sender_id=ME)
+    check("未启用" in r.text, f"ping flags a disabled deploy command (got {r.text[:300]!r})")
 
 
 if __name__ == "__main__":
