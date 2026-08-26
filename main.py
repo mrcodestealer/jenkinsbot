@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -713,6 +714,17 @@ def _console_tail_bytes(text: str, max_bytes: int) -> Tuple[str, int]:
     return cut, len(raw) - len(cut.encode("utf-8"))
 
 
+def _human_bytes(n: int) -> str:
+    """``202590375`` -> ``193.2 MB``. A raw byte count is unreadable at a glance, and whether
+    the number is plausible for a given job is the first thing worth noticing about it."""
+    size = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
 def _utf8_len(text: str, *, chunk: int = 1 << 20) -> int:
     """UTF-8 byte length of ``text`` without materialising a second copy of a huge log.
 
@@ -880,10 +892,14 @@ def _send_done_card(
         lines.append(f"- **Full log :** {log_file_name} (attached below)")
     elif log_too_big_bytes:
         # Feishu refuses any attachment over 30 MB and offers no chunked upload, so this log
-        # cannot be one file here. Say so, and point at the one place it IS one whole file.
+        # cannot be one file here. Say so — but do NOT repeat console_text_url, which the
+        # "Logs :" line directly above already carries; two identical links read as a bug.
+        # Bytes AND a human size: "202,590,375" is hard to sanity-check at a glance, and
+        # whether 193 MB is plausible for this job is the first thing worth noticing.
         lines.append(
-            f"- **Full log :** {log_too_big_bytes:,} bytes — 超过飞书附件上限 30 MB，无法作为单个附件发送。"
-            f"完整日志（一个链接，一个字节都没少）：{console_text_url}"
+            f"- **Full log :** {log_too_big_bytes:,} bytes"
+            f"（{_human_bytes(log_too_big_bytes)}）— 超过飞书附件上限 30 MB，无法作为附件发送；"
+            f"请用上面的 **Logs** 链接下载完整日志（一个文件，一个字节都没少）。"
         )
     body = "\n".join(lines)
 
@@ -2274,6 +2290,172 @@ def internal_vpn_conf_deliver():
     return jsonify({"ok": False, "error": msg}), 502
 
 
+# ---- chatops deploy: "@bot git pull and restart service" --------------------------------
+# This command pulls code and restarts the service, which is remote code execution by any other
+# name. Two deliberate guards:
+#
+#  1. FAIL CLOSED. Nothing runs until DEPLOY_ALLOWED_OPEN_IDS names who may do it. An empty
+#     allowlist refuses and explains, rather than trusting whoever happens to be in the chat.
+#  2. ANCHORED PATTERN. The whole message (minus @ mentions) must BE the command. A pasted
+#     Jenkins console containing "+ git pull origin main" must never deploy production, and a
+#     substring match would have done exactly that.
+#
+# The command itself is fixed: no branch, remote, or flag is ever taken from chat, and nothing
+# is run through a shell, so there is no injection surface.
+_DEPLOY_CMD_RE = re.compile(
+    r"""^\s*/?
+        (?:git\s*pull|gitpull|deploy)
+        (?:\s+origin)?(?:\s+main)?
+        (?:\s*(?:and|&|\+|,|then|然后|并且|并|再)\s*)?
+        # \s* not \s+ on the suffix: Chinese does not put spaces between words, so
+        # "并重启服务" has to match with no separators at all.
+        (?:(?P<restart>restart|重启)(?:\s*(?:the\s+)?(?:service|svc|bot|jenkinsbot|服务))?)?
+        \s*[.!?。！]*\s*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_deploy_lock = threading.Lock()
+
+
+def _deploy_repo_dir() -> str:
+    """The checkout to pull — the directory this module lives in."""
+    return str(Path(__file__).resolve().parent)
+
+
+def _deploy_service_name() -> str:
+    return (os.getenv("JENKINSBOT_SERVICE_NAME") or "jenkinsbot").strip() or "jenkinsbot"
+
+
+def _deploy_allowed_open_ids() -> set:
+    """Who may deploy. Empty set means the feature is off — see the note above."""
+    raw = (
+        os.getenv("DEPLOY_ALLOWED_OPEN_IDS")
+        or os.getenv("DEPLOY_ALLOWED_OPEN_ID")
+        or ""
+    )
+    return {p for p in re.split(r"[,\s;]+", raw) if p}
+
+
+def _parse_deploy_command(text: str) -> Optional[Dict[str, Any]]:
+    """``@bot git pull and restart service`` -> ``{"restart": True}``.
+
+    Returns ``None`` for anything that is not exactly this command. ``git pull`` on its own
+    pulls and reports without restarting; the restart happens only when asked for."""
+    clean = _strip_lark_mentions(text or "")
+    if not clean:
+        return None
+    m = _DEPLOY_CMD_RE.match(clean)
+    if not m:
+        return None
+    return {"restart": bool(m.group("restart"))}
+
+
+def _run_cmd(args: List[str], timeout: int) -> Tuple[int, str]:
+    """Run ``args`` with no shell; return ``(returncode, combined output)``. Never raises."""
+    try:
+        p = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
+        )
+        return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+    except FileNotFoundError:
+        return 127, f"{args[0]}: not found on this host"
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {timeout}s"
+    except Exception as exc:  # noqa: BLE001 — a deploy reply is better than a dead thread
+        return 1, f"{type(exc).__name__}: {exc}"
+
+
+def _restart_own_service(unit: str) -> None:
+    """Ask systemd to restart the unit this process IS.
+
+    ``systemctl restart`` hands the job to PID 1 and ``--no-block`` returns without waiting, so
+    the restart survives this process being killed — which is precisely what happens next. If
+    systemctl is missing or refuses, fall back to dying with a non-zero status, which both
+    ``Restart=on-failure`` and ``Restart=always`` treat as a reason to bring us back."""
+    rc, out = _run_cmd(["systemctl", "restart", "--no-block", f"{unit}.service"], 30)
+    if rc == 0:
+        logger.warning("restart requested for %s.service — this process is going away", unit)
+        return
+    logger.error(
+        "systemctl restart %s failed rc=%s out=%r — exiting non-zero so the unit's Restart= "
+        "policy brings us back instead",
+        unit,
+        rc,
+        out[:300],
+    )
+    # Give the reply above a moment to leave the socket before the process ends.
+    threading.Timer(2.0, lambda: os._exit(3)).start()
+
+
+def _handle_deploy_command(
+    opts: Dict[str, Any], *, chat_id: str, message_id: str, sender_id: str
+) -> None:
+    who = (sender_id or "").strip()
+    allowed = _deploy_allowed_open_ids()
+
+    def _out(text: str) -> None:
+        if not _reply_in_thread_message(message_id, "text", {"text": text}):
+            _send_chat_message(chat_id or NOTIFY_CHAT_ID, "text", {"text": text})
+
+    if not allowed:
+        logger.warning("deploy REFUSED — DEPLOY_ALLOWED_OPEN_IDS unset (sender=%s)", who or "?")
+        _out(
+            "⚠️ 部署命令默认关闭（它会拉代码并重启服务，等同远程执行）。\n"
+            "在 .env 加一行再重启一次服务即可启用：\n"
+            f"DEPLOY_ALLOWED_OPEN_IDS={who or 'ou_你的open_id'}"
+        )
+        return
+    if who not in allowed:
+        logger.warning("deploy DENIED sender=%s not in allowlist", who or "?")
+        _out(f"⚠️ 你没有部署权限。你的 open_id：{who or '(未知)'}")
+        return
+
+    if not _deploy_lock.acquire(blocking=False):
+        _out("⏳ 已有一个部署在进行，忽略这次。")
+        return
+    try:
+        repo = _deploy_repo_dir()
+        unit = _deploy_service_name()
+        logger.warning("DEPLOY started by %s repo=%s restart=%s", who, repo, opts.get("restart"))
+
+        before_rc, before = _run_cmd(
+            ["git", "-C", repo, "rev-parse", "--short", "HEAD"], 20
+        )
+        # --ff-only on purpose: if the server has local commits or edits, fail loudly rather
+        # than silently creating a merge commit on a production checkout.
+        rc, out = _run_cmd(["git", "-C", repo, "pull", "--ff-only", "origin", "main"], 180)
+        _, head = _run_cmd(["git", "-C", repo, "log", "-1", "--pretty=%h %s"], 20)
+        ok = rc == 0
+
+        lines = [
+            f"{'✅' if ok else '❌'} `git pull --ff-only origin main` — exit {rc}",
+            f"- 目录：{repo}",
+        ]
+        if before_rc == 0 and before:
+            lines.append(f"- 之前：{before}")
+        if head:
+            lines.append(f"- 现在：{head}")
+        lines.append("```\n" + ((out or "(no output)")[-1200:]) + "\n```")
+        if not ok:
+            lines.append("拉取失败，**未重启**。")
+        elif opts.get("restart"):
+            lines.append(f"正在重启 `{unit}.service` …")
+        else:
+            lines.append(f"未重启（加上 restart 才会重启，例如 `git pull and restart service`）。")
+        _out("\n".join(lines))
+
+        logger.warning("DEPLOY pull rc=%s by=%s head=%r", rc, who, head[:120])
+        if ok and opts.get("restart"):
+            _restart_own_service(unit)
+    finally:
+        _deploy_lock.release()
+
+
 def _process_message_command(
     text: str, message_id: str, event_chat_id: str, sender_id: str = ""
 ) -> None:
@@ -2281,6 +2463,16 @@ def _process_message_command(
     Lark gets a fast 200 and does not retry (retries previously caused minutes-long delays)."""
     try:
         chat_id = event_chat_id or NOTIFY_CHAT_ID
+
+        deploy = _parse_deploy_command(text)
+        if deploy is not None:
+            _handle_deploy_command(
+                deploy,
+                chat_id=chat_id,
+                message_id=(message_id or "").strip(),
+                sender_id=sender_id,
+            )
+            return
 
         find_qs = _parse_find_vpn_conf_command(text)
         if find_qs is not None:

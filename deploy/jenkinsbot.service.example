@@ -16,7 +16,10 @@ ExecStart=/root/miniconda3/bin/python /root/jenkinsbot/main.py
 # Optional: SSL for lark-oapi WebSocket on some hosts
 # Environment=SSL_CERT_FILE=/root/miniconda3/lib/python3.13/site-packages/certifi/cacert.pem
 
-Restart=on-failure
+# Restart=always, not on-failure: the chatops "git pull and restart service" command asks
+# systemd to restart this unit, and its fallback path (used only if systemctl is unavailable)
+# exits the process deliberately. on-failure would leave the bot down after a clean exit.
+Restart=always
 RestartSec=10
 
 [Install]
