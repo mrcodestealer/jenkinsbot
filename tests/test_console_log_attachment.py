@@ -520,9 +520,8 @@ def test_the_card_names_the_file_that_actually_arrives() -> None:
 
 
 def test_the_delivered_file_is_a_plain_log_by_default() -> None:
-    """A .gz has to be unpacked before you can read a line of it, so plain .log is the default.
-    Lark refuses any single upload over 30 MB, so a console past that becomes
-    {pipeline}.partNofM.log — still plain, still one click each — never one .log.gz."""
+    """A .gz has to be unpacked before you can read a line of it, so plain .log is the default
+    for anything that FITS — which is the overwhelming majority of builds."""
     check(jb._log_gzip_enabled() is False, "gzip is OFF unless explicitly asked for")
 
     with Capture() as cap:
@@ -532,23 +531,74 @@ def test_the_delivered_file_is_a_plain_log_by_default() -> None:
         f"an ordinary build is exactly {{pipeline}}.log (got {[u[0] for u in cap.uploads]!r})",
     )
 
+
+def test_an_over_cap_console_is_gzipped_rather_than_not_attached_at_all() -> None:
+    """The default pair used to deliver NOTHING, and that is what operators actually hit.
+
+    ``JENKINS_LOG_SINGLE_FILE_ONLY=1`` (default) plus ``JENKINS_LOG_GZIP=0`` (default) meant a
+    193 MB FPMS_PROD_SCRIPT_RUN console arrived as a bare consoleText link — "one file" and "no
+    gzip" together leave nothing that fits under 30 MB. Gzip honours BOTH: it is one file, and a
+    Jenkins console measures ~16x, so 200 MB lands near 12 MB.
+
+    Plain ``.log`` is unaffected for anything that fits (previous test), so this only changes the
+    case where a plain ``.log`` was impossible in the first place.
+    """
     log = "".join(f"[{i:08d}] a line of jenkins output\n" for i in range(80000))
     os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = "1048576"
     try:
         check(jb._log_single_file_only() is True, "one attachment or none, by default")
-        names = [
-            n
-            for n, _b in jb._console_log_payloads(
-                log, base_name="FPMS_PROD_SCRIPT_RUN.log", cap=jb._log_file_max_bytes()
-            )
-        ]
-        check(names == [], f"over the ceiling: nothing is split off (got {names[:3]!r})")
-        shown = jb._console_log_display_name(
-            len(log.encode("utf-8")),
-            "FPMS_PROD_SCRIPT_RUN.log",
-            jb._log_file_max_bytes(),
+        check(jb._log_gzip_enabled() is False, "and gzip still not explicitly enabled")
+        cap_bytes = jb._log_file_max_bytes()
+        payloads = jb._console_log_payloads(
+            log, base_name="FPMS_PROD_SCRIPT_RUN.log", cap=cap_bytes
         )
-        check(shown == "", f"and no file is named that will not arrive (got {shown!r})")
+        names = [n for n, _b in payloads]
+        check(
+            names == ["FPMS_PROD_SCRIPT_RUN.log.gz"],
+            f"exactly ONE gzip, not nothing and not parts (got {names!r})",
+        )
+        check(
+            all(len(b) <= cap_bytes for _n, b in payloads),
+            "and it fits under the ceiling",
+        )
+        shown = jb._console_log_display_name(
+            len(log.encode("utf-8")), "FPMS_PROD_SCRIPT_RUN.log", cap_bytes
+        )
+        check(
+            shown == names[0],
+            f"the card must name the file that actually arrives (card {shown!r} vs {names[0]!r})",
+        )
+        # The whole log, not a truncation — the point of gzipping rather than tailing.
+        import gzip as _gz
+
+        check(
+            _gz.decompress(payloads[0][1]) == log.encode("utf-8"),
+            "the gzip must round-trip to the COMPLETE console, byte for byte",
+        )
+    finally:
+        os.environ.pop("JENKINS_LOG_FILE_MAX_BYTES", None)
+
+
+def test_nothing_is_attached_only_when_even_a_gzip_cannot_fit() -> None:
+    """The "or none" half of single-file-only still has to hold somewhere.
+
+    Random bytes do not compress, so this is the one shape that genuinely cannot be one
+    attachment. Splitting is what single-file-only forbids, so the card falls back to the URL.
+    """
+    import base64
+    import os as _os
+
+    incompressible = base64.b64encode(_os.urandom(3_000_000)).decode("ascii")
+    os.environ["JENKINS_LOG_FILE_MAX_BYTES"] = "1048576"
+    try:
+        payloads = jb._console_log_payloads(
+            incompressible, base_name="FPMS_PROD_SCRIPT_RUN.log", cap=jb._log_file_max_bytes()
+        )
+        check(
+            payloads == [],
+            f"a console that will not compress under the cap attaches nothing when splitting is "
+            f"forbidden (got {[n for n, _b in payloads]!r})",
+        )
     finally:
         os.environ.pop("JENKINS_LOG_FILE_MAX_BYTES", None)
 

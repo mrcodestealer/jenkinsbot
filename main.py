@@ -1870,6 +1870,22 @@ def _upload_file_lark(
     return (data.get("data") or {}).get("file_key")
 
 
+def _log_gzip_for_oversize() -> bool:
+    """Should an over-cap console be gzipped into ONE attachment?
+
+    Yes when gzip is asked for — and also when the only other outcome is attaching NOTHING.
+    ``JENKINS_LOG_SINGLE_FILE_ONLY=1`` (default) plus ``JENKINS_LOG_GZIP=0`` (default) used to
+    mean a 200 MB console arrived as a bare consoleText link, because "one file" and "no gzip"
+    together leave nothing that fits. Gzip satisfies BOTH preferences: it is one file, and a
+    Jenkins console measures ~16x, so 200 MB lands near 12 MB — comfortably inside the 30 MB cap.
+
+    Plain ``.log`` stays the default for anything that fits, which is the overwhelming majority,
+    so the "don't make me unpack a file to read it" intent is untouched. This only decides what
+    happens when a plain ``.log`` is impossible.
+    """
+    return _log_gzip_enabled() or _log_single_file_only()
+
+
 def _console_log_display_name(total_bytes: int, base_name: str, cap: int) -> str:
     """What the card should CALL the attachment.
 
@@ -1879,10 +1895,11 @@ def _console_log_display_name(total_bytes: int, base_name: str, cap: int) -> str
     drift apart."""
     if total_bytes <= cap:
         return base_name
-    if _log_single_file_only() and not _log_gzip_enabled():
-        return ""  # nothing will be attached; the card points at the consoleText URL instead
     stem = base_name[:-4] if base_name.lower().endswith(".log") else base_name
-    if _log_gzip_enabled():
+    if _log_gzip_for_oversize():
+        # Predicted before the gzip runs, so a console that somehow fails to compress under the
+        # cap can still fall through to "upload failed" — the same imprecision this function has
+        # always had for part counts, and the upload path already reports it.
         return f"{stem}.log.gz"
     # Plain parts are exactly cap-sized, so the count is known without doing the work.
     parts = -(-total_bytes // cap)
@@ -1898,21 +1915,20 @@ def _console_log_payloads(
     than one blob. Tiers, in order of how much the reader has to do:
 
     1. Fits as-is -> plain ``{pipeline}.log``, openable in one click.
-    2. Too big, gzip allowed -> ONE ``{pipeline}.log.gz``. A Jenkins console compresses
-       10-30x, so ~190 MB lands well under a megabyte.
-    3. Too big for even a gzip (or ``JENKINS_LOG_GZIP=0``) -> numbered parts. Every byte
-       still ships; with gzip off the parts are plain ``.log`` files you can open directly.
+    2. Too big -> ONE ``{pipeline}.log.gz``, whenever gzip is enabled OR splitting is not
+       allowed (see :func:`_log_gzip_for_oversize`). A Jenkins console measures ~16x, so a
+       200 MB console lands near 12 MB.
+    3. Too big for even one gzip, splitting allowed -> numbered parts. Every byte still ships.
+    4. Too big for even one gzip, splitting NOT allowed -> nothing; the card carries the size
+       and the consoleText URL.
     """
     raw = (text or "").encode("utf-8", errors="replace")
     if len(raw) <= cap:
         return [(base_name, raw)]
-    if _log_single_file_only() and not _log_gzip_enabled():
-        # One attachment or none. Splitting is what the caller asked us not to do.
-        return []
 
     stem = base_name[:-4] if base_name.lower().endswith(".log") else base_name
 
-    if not _log_gzip_enabled():
+    if not _log_gzip_for_oversize():
         # Plain parts: each chunk IS the payload, so cap bounds it directly.
         chunks = range(0, len(raw), cap)
         total = len(chunks)
@@ -1924,6 +1940,10 @@ def _console_log_payloads(
     gz = gzip.compress(raw, compresslevel=6)
     if len(gz) <= cap:
         return [(f"{stem}.log.gz", gz)]
+    if _log_single_file_only():
+        # Even gzipped it will not fit, and splitting is what the caller asked us not to do.
+        # One attachment or none still means none here — the card falls back to the URL.
+        return []
 
     # Only reachable for a console in the hundreds of MB that barely compresses. Size chunks by
     # the compression ratio we just measured, NOT by ``cap`` — chunking raw bytes at ``cap``
