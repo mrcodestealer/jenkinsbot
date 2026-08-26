@@ -223,14 +223,35 @@ DUTY_BOT_OPEN_ID = (os.getenv("DUTY_BOT_OPEN_ID") or "ou_1f6596a9923a2a835918e7e
 # import, so an edited .env changes nothing until a restart, and a variable already present in the
 # process environment (systemd ``Environment=``) silently beats the .env file because
 # ``_load_dotenv`` only fills keys that are not already set. One log line answers all of that.
-for _id_name, _id_val, _id_fallback in (
-    ("DUTY_BOT_OPEN_ID (duty commands -> the UPDATE bot)", DUTY_BOT_OPEN_ID,
-     "ou_1f6596a9923a2a835918e7e2513595d5"),
-    ("TAG_USER_OPEN_ID (human done/stuck notices)", TAG_USER_OPEN_ID,
-     "ou_d7bc33724e2d6ced4050c944c2ca5650"),
+# Provenance is reported from whether the variable was SET, never from what its value happens to
+# be. The first version of this compared the value against the fallback literal and printed
+# "BUILT-IN FALLBACK" for an id that was explicitly configured — because .env carried the stale
+# literal as an actual value (copied from an .env.example that shipped it that way). That sent the
+# search to "the variable isn't reaching the process" when the real answer was "it is set, to the
+# wrong thing", which are opposite fixes.
+for _id_name, _id_env_keys, _id_val, _id_stale in (
+    (
+        "DUTY_BOT_OPEN_ID (duty commands -> the UPDATE bot)",
+        ("DUTY_BOT_OPEN_ID",),
+        DUTY_BOT_OPEN_ID,
+        "ou_1f6596a9923a2a835918e7e2513595d5",
+    ),
+    (
+        "TAG_USER_OPEN_ID (human done/stuck notices)",
+        ("JENKINS_TAG_OPEN_ID", "omduty", "OMDUTY", "NOTIFY_USER_OPEN_ID"),
+        TAG_USER_OPEN_ID,
+        "ou_d7bc33724e2d6ced4050c944c2ca5650",
+    ),
 ):
-    _src = "BUILT-IN FALLBACK — probably wrong for this tenant" if _id_val == _id_fallback else "from env"
-    logger.info("@mention target %s = %s (%s)", _id_name, _id_val or "(unset)", _src)
+    _set_by = next((k for k in _id_env_keys if (os.getenv(k) or "").strip()), "")
+    _src = f"set by {_set_by}" if _set_by else "NOT SET — using the built-in fallback"
+    _warn = (
+        "  ⚠️ this is the osedutybot literal this repo was mirrored with; verify it with /secret1 "
+        "IN THIS BOT (open_id is per-app)"
+        if _id_val == _id_stale
+        else ""
+    )
+    logger.info("@mention target %s = %s (%s)%s", _id_name, _id_val or "(empty)", _src, _warn)
 
 
 def _at_mention_card(open_id: str) -> str:
