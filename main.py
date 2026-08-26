@@ -660,6 +660,17 @@ def _react_progress_end(message_id: str, working_id: Optional[str], *, ok: bool)
     _add_message_reaction_id(message_id, emoji)
 
 
+def _event_mentions(event: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """``message.mentions`` — one entry per @ in the text, each carrying the ``@_user_N`` key
+    it was substituted for plus ``id.open_id``. This is the only place an open_id for a
+    mentioned user or bot is available."""
+    msg = event.get("message") if isinstance(event.get("message"), dict) else {}
+    raw = msg.get("mentions")
+    if not isinstance(raw, list):
+        raw = event.get("mentions")
+    return [m for m in raw if isinstance(m, dict)] if isinstance(raw, list) else []
+
+
 def _event_sender_open_id(event: Dict[str, Any]) -> str:
     sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
     sid = sender.get("sender_id")
@@ -1003,6 +1014,16 @@ def _send_done_card(
     else:
         summary = "**done update kindly check**"
 
+    # ONE line about the log, never two. When the console is too big to attach, the size and the
+    # reason ride on the Logs line itself rather than becoming a second bullet that repeats the
+    # same URL — the earlier version printed the link twice, and even once de-duplicated it was
+    # still two lines saying one thing.
+    logs_line = f"- **Logs :** {console_text_url}"
+    if log_too_big_bytes and not log_file_name:
+        logs_line += (
+            f" — 完整日志 {_human_bytes(log_too_big_bytes)}"
+            f"（{log_too_big_bytes:,} bytes），超过飞书附件上限 30 MB，请点链接下载"
+        )
     lines = [
         f"{at}\n{summary}\n",
         f"- **Environment：** {environment}",
@@ -1010,21 +1031,10 @@ def _send_done_card(
         f"- **Build：** #{build}",
         f"- **状态：** {result}",
         f"- **链接：** {build_url}",
-        f"- **Logs :** {console_text_url}",
+        logs_line,
     ]
     if log_file_name:
         lines.append(f"- **Full log :** {log_file_name} (attached below)")
-    elif log_too_big_bytes:
-        # Feishu refuses any attachment over 30 MB and offers no chunked upload, so this log
-        # cannot be one file here. Say so — but do NOT repeat console_text_url, which the
-        # "Logs :" line directly above already carries; two identical links read as a bug.
-        # Bytes AND a human size: "202,590,375" is hard to sanity-check at a glance, and
-        # whether 193 MB is plausible for this job is the first thing worth noticing.
-        lines.append(
-            f"- **Full log :** {log_too_big_bytes:,} bytes"
-            f"（{_human_bytes(log_too_big_bytes)}）— 超过飞书附件上限 30 MB，无法作为附件发送；"
-            f"请用上面的 **Logs** 链接下载完整日志（一个文件，一个字节都没少）。"
-        )
     body = "\n".join(lines)
 
     # Window BEFORE sanitising — see _LOG_CARD_SCAN_CHARS. The panel can only ever hold ~24 KB
@@ -2153,6 +2163,7 @@ def _jenkins_watch_worker(
                 log_too_big_bytes=log_too_big or None,
             )
             # VPN: the threaded card + .conf are enough — skip the plain "Done update…" line.
+            _watch_react_finish(meta, result)
             if not is_vpn_mode:
                 _send_done_notify(
                     result,
@@ -2304,6 +2315,9 @@ def _start_jenkins_watch_from_url(
                 "past a segment that has not built)",
                 job_base, build, watch_key[2],
             )
+            # No second watcher means nothing will ever resolve this command's reaction, and
+            # the watcher that IS running owns the reaction on its own triggering message.
+            _watch_react_abort(watch_meta, failed=False)
             return "ok", build, pipeline, path_env
         _active_watches.add(watch_key)
         if isinstance(meta, dict) and meta.get("mode"):
@@ -2531,6 +2545,125 @@ _PING_CMD_RE = re.compile(
 )
 
 
+def _watch_react_begin(message_id: str, meta: Dict[str, Any]) -> None:
+    """React "working on it" on the triggering message, and stash the ids in ``meta``.
+
+    A build watch finishes minutes or hours later, on another thread, so the reaction_id needed
+    to take the reaction off again has to travel with the watcher —
+    :func:`_start_jenkins_watch_from_url` copies ``meta`` into the worker's own dict, so these
+    two keys arrive intact."""
+    mid = (message_id or "").strip()
+    if not mid or not isinstance(meta, dict):
+        return
+    meta["react_message_id"] = mid
+    meta["react_working_id"] = _react_progress_start(mid) or ""
+
+
+def _watch_react_abort(meta: Optional[Dict[str, Any]], *, failed: bool) -> None:
+    """No watcher will ever finish this reaction, so resolve it here.
+
+    ``failed=True`` for a watch that could not start (bad build number, no permission) — that is
+    a real failure and gets the failure emoji. ``failed=False`` for a duplicate command whose
+    build is already being watched: nothing went wrong, the first watcher will report, so just
+    take the in-progress reaction off rather than crying failure on a no-op."""
+    if not isinstance(meta, dict):
+        return
+    mid = str(meta.get("react_message_id") or "")
+    if not mid:
+        return
+    rid = str(meta.get("react_working_id") or "")
+    try:
+        if failed:
+            _react_progress_end(mid, rid or None, ok=False)
+        elif rid:
+            _remove_message_reaction(mid, rid)
+    except Exception as exc:
+        logger.warning("watch reaction abort failed: %s", exc)
+    meta.pop("react_message_id", None)
+    meta.pop("react_working_id", None)
+
+
+def _watch_react_finish(meta: Optional[Dict[str, Any]], result: str) -> None:
+    """Swap the watch's in-progress reaction for DONE / CrossMark once Jenkins finishes.
+
+    Best effort and never raises: the duty-bot callbacks run after this, and a missing emoji
+    must never be the reason an /updatemore queue is left parked."""
+    if not isinstance(meta, dict):
+        return
+    mid = str(meta.get("react_message_id") or "")
+    if not mid:
+        return
+    try:
+        _react_progress_end(
+            mid,
+            str(meta.get("react_working_id") or "") or None,
+            ok=(result or "").upper() == "SUCCESS",
+        )
+    except Exception as exc:
+        logger.warning("watch reaction finish failed: %s", exc)
+    meta.pop("react_message_id", None)
+    meta.pop("react_working_id", None)
+
+
+_SECRET_CMD_RE = re.compile(
+    r"""^\s*
+        (?:@\S+(?:[ \t]+\S+){0,4}[ \t]+)?
+        \s*/?secret1\b.*$""",
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
+
+
+def _parse_secret1_command(text: str) -> bool:
+    """``/secret1 @someone`` — look up the open_id of whoever is mentioned."""
+    clean = _strip_lark_mentions(text or "")
+    # _strip_lark_mentions removes the placeholders, so match on the raw text too: the command
+    # word may be the only thing left once every @ token is gone.
+    return bool(_SECRET_CMD_RE.match(clean)) or bool(
+        _SECRET_CMD_RE.match((text or "").strip())
+    )
+
+
+def _handle_secret1_command(
+    *,
+    chat_id: str,
+    message_id: str,
+    sender_id: str,
+    mentions: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Report the open_id of every @-mentioned user/bot, plus the caller's own.
+
+    open_id is per-application, so these values only mean anything to THIS app — but they are
+    exactly what ``DEPLOY_ALLOWED_OPEN_IDS`` and ``JENKINS_TAG_OPEN_ID`` need, and there is no
+    other way to read one from inside a chat."""
+    rows: List[str] = []
+    seen = set()
+    for m in mentions or []:
+        if not isinstance(m, dict):
+            continue
+        ids = m.get("id") if isinstance(m.get("id"), dict) else {}
+        oid = str(ids.get("open_id") or "").strip()
+        if not oid or oid in seen:
+            continue
+        seen.add(oid)
+        name = str(m.get("name") or "").strip() or "(no name)"
+        # mentioned_type is absent from the Lark-international docs, so treat it as optional.
+        kind = str(m.get("mentioned_type") or "").strip()
+        kind_label = {"bot": "机器人", "user": "用户"}.get(kind, kind or "?")
+        rows.append(f"- **{name}**（{kind_label}）\n  `{oid}`")
+
+    me = (sender_id or "").strip()
+    if me and me not in seen:
+        rows.append(f"- **你自己**（用户）\n  `{me}`")
+
+    if not rows:
+        rows.append("（没拿到任何 open_id — @ 一下要查的人或机器人，例如 `/secret1 @某人`）")
+
+    text = "\n".join(["**open_id**", *rows])
+    if not _reply_in_thread_message(message_id, "text", {"text": text}):
+        _send_chat_message(chat_id or NOTIFY_CHAT_ID, "text", {"text": text})
+    logger.info("secret1 answered for %s ids=%d", me or "?", len(seen))
+
+
 def _parse_ping_command(text: str) -> bool:
     """``@bot ping`` — answer "is the new code even running, and can you react?" in the chat.
 
@@ -2658,12 +2791,25 @@ def _handle_deploy_command(
 
 
 def _process_message_command(
-    text: str, message_id: str, event_chat_id: str, sender_id: str = ""
+    text: str,
+    message_id: str,
+    event_chat_id: str,
+    sender_id: str = "",
+    mentions: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Heavy work (build-exists checks, replies, watch start) — runs off the webhook thread so
     Lark gets a fast 200 and does not retry (retries previously caused minutes-long delays)."""
     try:
         chat_id = event_chat_id or NOTIFY_CHAT_ID
+
+        if _parse_secret1_command(text):
+            _handle_secret1_command(
+                chat_id=chat_id,
+                message_id=(message_id or "").strip(),
+                sender_id=sender_id,
+                mentions=mentions,
+            )
+            return
 
         if _parse_ping_command(text):
             _handle_ping_command(
@@ -2700,9 +2846,12 @@ def _process_message_command(
             # posted inside the user's original ``create vpn`` thread).
             vpn["reply_message_id"] = (message_id or "").strip()
             url = f"{vpn['job_base'].rstrip('/')}/{vpn['build']}/"
+            _watch_react_begin(message_id, vpn)
             status, build_no, _pipeline, _path_env = _start_jenkins_watch_from_url(
                 url, text, meta=vpn
             )
+            if status != "ok":
+                _watch_react_abort(vpn, failed=True)
             if status == "ok":
                 _reply_in_thread_message(
                     message_id,
@@ -2728,9 +2877,12 @@ def _process_message_command(
             inform["chat_id"] = event_chat_id or NOTIFY_CHAT_ID
             inform["reply_message_id"] = (message_id or "").strip()
             url = f"{inform['job_base'].rstrip('/')}/{inform['build']}/"
+            _watch_react_begin(message_id, inform)
             status, build_no, pipeline, _path_env = _start_jenkins_watch_from_url(
                 url, text, meta=inform
             )
+            if status != "ok":
+                _watch_react_abort(inform, failed=True)
             if status == "ok":
                 mode = inform.get("mode") or "inform"
                 _reply_in_thread_message(
@@ -2755,15 +2907,17 @@ def _process_message_command(
         jenkins_urls = [u for u in _extract_urls(text) if _is_jenkins_job_url(u)]
         if jenkins_urls:
             url = jenkins_urls[0]
+            watch_kw: Dict[str, Any] = {
+                "mode": "watch",
+                "chat_id": event_chat_id or NOTIFY_CHAT_ID,
+                "reply_message_id": (message_id or "").strip(),
+            }
+            _watch_react_begin(message_id, watch_kw)
             status, build_no, pipeline, path_env = _start_jenkins_watch_from_url(
-                url,
-                text,
-                meta={
-                    "mode": "watch",
-                    "chat_id": event_chat_id or NOTIFY_CHAT_ID,
-                    "reply_message_id": (message_id or "").strip(),
-                },
+                url, text, meta=watch_kw
             )
+            if status != "ok":
+                _watch_react_abort(watch_kw, failed=True)
             if status == "ok":
                 _poll_hint = (
                     str(int(POLL_SECONDS))
@@ -2874,7 +3028,13 @@ def webhook_event():
     #  delayed the ACK and Lark retried with backoff — causing minutes-long delays.)
     threading.Thread(
         target=_process_message_command,
-        args=(text, message_id, event_chat_id, _event_sender_open_id(event)),
+        args=(
+            text,
+            message_id,
+            event_chat_id,
+            _event_sender_open_id(event),
+            _event_mentions(event),
+        ),
         daemon=True,
         name=f"jenkinsbot-msg-{(message_id or '')[:12]}",
     ).start()
@@ -3818,7 +3978,13 @@ def _handle_ws_im_message(data) -> None:
         return
     threading.Thread(
         target=_process_message_command,
-        args=(text, message_id, event_chat_id, _event_sender_open_id(event)),
+        args=(
+            text,
+            message_id,
+            event_chat_id,
+            _event_sender_open_id(event),
+            _event_mentions(event),
+        ),
         daemon=True,
         name=f"jenkinsbot-ws-{(message_id or '')[:12]}",
     ).start()
