@@ -1208,8 +1208,26 @@ def _send_duty_bot_finish_tag(
     chat_id: Optional[str] = None,
     reply_message_id: Optional[str] = None,
 ) -> None:
-    """After a Jenkins build finishes, post a message **@-tagging the duty bot** (in the same
-    thread/chat as the done card). Informational only — carries no slash command."""
+    """After a Jenkins build finishes, post a plain-text line @-tagging the duty user.
+
+    OFF by default — set ``JENKINSBOT_FINISH_TAG=1`` to restore it.
+
+    It duplicates the done card that was just posted: the card already carries the same result,
+    environment, pipeline and build number, and it already @-mentions the same person via
+    ``_tag_user_at_card``. So the chat got the finish twice, once as a card and once as
+    "@CP OM Duty Jenkins Finished: SUCCESS | prod / BI-API-UPDATE #4257" plus the URL.
+
+    Dropping it also closes a latent loop: this line re-injects a raw Jenkins build URL into the
+    chat, and ``_process_message_command`` starts a watch from ANY Jenkins URL in a message that
+    mentions the bot, with no self-sender filter. If this bot ever sees its own finish tag it arms
+    another watcher, which posts another finish tag.
+    """
+    if not _env_flag("JENKINSBOT_FINISH_TAG", "0"):
+        logger.info(
+            "finish @ tag disabled (JENKINSBOT_FINISH_TAG unset) — the done card already "
+            "reports this build and mentions the same user"
+        )
+        return
     if not TAG_USER_OPEN_ID:
         logger.warning("TAG_USER_OPEN_ID missing — skip finish @ tag")
         return
