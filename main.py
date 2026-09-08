@@ -292,7 +292,13 @@ try:
 except ValueError:
     POLL_SECONDS = 1.0
 
-STUCK_SECONDS = int(_env("JENKINS_STUCK_SECONDS") or "600")
+# Stuck warning threshold. Optional (unlike most keys here): absent from .env => 1 hour, because
+# a long build step can legitimately print nothing for a long while and a short threshold just
+# cries wolf. .env still overrides. Never stops monitoring — see _send_stuck_card.
+try:
+    STUCK_SECONDS = max(30, int((os.getenv("JENKINS_STUCK_SECONDS") or "3600").strip()))
+except ValueError:
+    STUCK_SECONDS = 3600
 
 # ---- console-log delivery (done-card expand/collapse panel + .log attachment) ------------
 # Lark rejects a card whose whole REQUEST BODY exceeds 30 KB. The card JSON is escaped TWICE
@@ -348,6 +354,48 @@ _VPN_TRAILING_NUM_RE = re.compile(r"(\d+)\s*$")
 
 _watch_meta_lock = threading.Lock()
 _watch_meta: Dict[Tuple[str, int], Dict[str, Any]] = {}
+
+# User-requested "stop monitoring this build". Monitoring NEVER stops on its own for a stuck log —
+# the stuck card only warns; the watcher keeps polling until the build finishes. It stops early only
+# when someone taps the cancel button on that card, which lands here.
+_watch_cancel_lock = threading.Lock()
+_watch_cancelled: set = set()  # {(job_base, build)}
+_watch_cancel_tokens: Dict[str, Tuple[str, int]] = {}  # short button token -> (job_base, build)
+
+
+def _watch_cancel_token_new(job_base: str, build: int) -> str:
+    """Mint a short token for a cancel button (keeps the long job URL out of the card payload)."""
+    tok = secrets.token_hex(6)
+    with _watch_cancel_lock:
+        _watch_cancel_tokens[tok] = (job_base, int(build))
+    return tok
+
+
+def _watch_cancel_request(token: str) -> Optional[Tuple[str, int]]:
+    """Flag the build behind ``token`` as cancelled; returns the key, or None if unknown/expired."""
+    tok = (token or "").strip()
+    if not tok:
+        return None
+    with _watch_cancel_lock:
+        key = _watch_cancel_tokens.get(tok)
+        if key is not None:
+            _watch_cancelled.add(key)
+    return key
+
+
+def _watch_is_cancelled(job_base: str, build: int) -> bool:
+    with _watch_cancel_lock:
+        return (job_base, int(build)) in _watch_cancelled
+
+
+def _watch_cancel_clear(job_base: str, build: int) -> None:
+    """Drop cancel state + tokens once a watcher ends, so a re-run of the same build starts clean."""
+    key = (job_base, int(build))
+    with _watch_cancel_lock:
+        _watch_cancelled.discard(key)
+        for tok, k in list(_watch_cancel_tokens.items()):
+            if k == key:
+                _watch_cancel_tokens.pop(tok, None)
 
 # Watchers currently running, keyed ``(job_base, build, mode)``. Guarded by ``_watch_meta_lock``.
 #
@@ -1250,33 +1298,60 @@ def _send_stuck_card(
     *,
     chat_id: Optional[str] = None,
     reply_message_id: Optional[str] = None,
+    job_base: str = "",
+    build: int = 0,
 ) -> None:
+    """
+    Warn that the console log has not changed for ``STUCK_SECONDS``. This is only a WARNING —
+    monitoring keeps running by default. The card carries a cancel button so a human can decide to
+    stop watching this build; doing nothing keeps it monitored until the build finishes.
+    """
     target_chat = (chat_id or "").strip() or NOTIFY_CHAT_ID
     at = _tag_user_at_card()
     snippet = (last_snippet or "").strip()[-1200:]
+    mins = max(1, int(STUCK_SECONDS // 60))
+    elements: List[Dict[str, Any]] = [
+        {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": (
+                    f"{at}\n日志 **{mins} 分钟**（{STUCK_SECONDS}s）内无变化，可能卡住。\n\n"
+                    f"✅ **监控仍在继续**（默认不停）。若确定不用再看这个 build，"
+                    f"点下面的按钮停止监控。\n\n"
+                    f"末尾内容：\n```\n{snippet}\n```"
+                ),
+            },
+        }
+    ]
+    if job_base and int(build or 0) > 0:
+        tok = _watch_cancel_token_new(job_base, int(build))
+        elements.append({"tag": "hr"})
+        elements.append(
+            _vpn_find_button_row(
+                [
+                    _vpn_find_callback_button(
+                        f"🛑 停止监控 build #{int(build)}",
+                        "danger",
+                        {"k": "jk_watch_cancel", "t": tok},
+                        element_id="jkwcan",
+                    )
+                ]
+            )
+        )
     card = {
-        "config": {"wide_screen_mode": True},
+        "schema": "2.0",
+        "config": {"update_multi": True, "width_mode": "fill"},
         "header": {
             "template": "orange",
             "title": {"tag": "plain_text", "content": "Jenkins 日志可能卡住"},
         },
-        "elements": [
-            {
-                "tag": "div",
-                "text": {
-                    "tag": "lark_md",
-                    "content": (
-                        f"{at}\n日志 **{STUCK_SECONDS}s** 内无变化，可能卡住。\n\n"
-                        f"末尾内容：\n```\n{snippet}\n```"
-                    ),
-                },
-            }
-        ],
+        "body": {"elements": elements},
     }
     ok = _emit_message(
         "interactive", card, chat_id=target_chat, reply_message_id=reply_message_id
     )
-    logger.info("send_stuck_card ok=%s chat=%s", ok, target_chat)
+    logger.info("send_stuck_card ok=%s chat=%s build=%s", ok, target_chat, build)
 
 
 def _extract_urls(text: str) -> List[str]:
@@ -2165,6 +2240,24 @@ def _jenkins_watch_worker(
     stuck_sent = False
 
     while True:
+        # Only a human tapping the stuck card's button gets us here; a stuck log alone never
+        # stops monitoring.
+        if _watch_is_cancelled(job_base, build):
+            logger.info("jenkins watch cancelled by user job_base=%s build=%s", job_base, build)
+            try:
+                _emit_message(
+                    "text",
+                    {"text": f"🛑 已停止监控 build #{build}（用户取消）。"},
+                    chat_id=target_chat,
+                    reply_message_id=reply_mid,
+                )
+            except Exception as exc:
+                logger.warning("cancel notice send failed: %s", exc)
+            with _watch_meta_lock:
+                _watch_meta.pop((job_base, build), None)
+            _watch_cancel_clear(job_base, build)
+            return
+
         text = _fetch_console_text(console_url, auth)
         now = time.monotonic()
 
@@ -2302,13 +2395,20 @@ def _jenkins_watch_worker(
                         logger.exception("console log failure note failed: %s", exc)
             with _watch_meta_lock:
                 _watch_meta.pop((job_base, build), None)
+            _watch_cancel_clear(job_base, build)
             return
 
         if (not stuck_sent) and (now - unchanged_since) >= STUCK_SECONDS:
             stuck_sent = True
             tail = (text or "")[-1500:]
             logger.warning("jenkins stuck build=%s", build)
-            _send_stuck_card(tail, chat_id=target_chat, reply_message_id=reply_mid)
+            _send_stuck_card(
+                tail,
+                chat_id=target_chat,
+                reply_message_id=reply_mid,
+                job_base=job_base,
+                build=build,
+            )
 
         time.sleep(POLL_SECONDS)
 
@@ -3637,6 +3737,18 @@ def _process_card_action_payload(payload: Dict[str, Any]) -> None:
                     chat_id=chat_id,
                     reply_message_id=thread_root,
                 )
+            return
+
+        if k == "jk_watch_cancel":
+            key = _watch_cancel_request(str(value.get("t") or ""))
+            if key is None:
+                _emit_message(
+                    "text",
+                    {"text": "该监控已结束或按钮已过期。"},
+                    chat_id=chat_id,
+                )
+                return
+            logger.info("watch cancel requested job_base=%s build=%s by=%s", key[0], key[1], sender_id)
             return
 
         if k != "vpn_find":
