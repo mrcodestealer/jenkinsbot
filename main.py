@@ -19,6 +19,11 @@ from urllib.parse import urlparse, unquote
 import requests
 from flask import Flask, jsonify, request
 
+try:
+    import health_report  # daily health card; optional, so a missing file never blocks boot
+except Exception:
+    health_report = None
+
 
 def _load_dotenv(env_path: Path) -> None:
     """Load KEY=VALUE lines from .env (no python-dotenv dependency)."""
@@ -2272,6 +2277,8 @@ def _jenkins_watch_worker(
         fin = _FINISHED_RE.search(text or "")
         if fin:
             result = fin.group(1)
+            if health_report is not None:
+                health_report.bump(f"Jenkins builds finished ({result})")
             ctx = _resolve_job_context(job_base, build, text or "", auth)
             logger.info(
                 "jenkins finished %s build=%s env=%s pipeline=%s",
@@ -2516,6 +2523,8 @@ def _start_jenkins_watch_from_url(
         name=f"jenkins-watch-{build}",
     )
     t.start()
+    if health_report is not None:
+        health_report.bump("Jenkins watches started")
     return "ok", build, pipeline, path_env
 
 
@@ -2977,6 +2986,9 @@ def _process_message_command(
     """Heavy work (build-exists checks, replies, watch start) — runs off the webhook thread so
     Lark gets a fast 200 and does not retry (retries previously caused minutes-long delays)."""
     try:
+        if health_report is not None:  # every deduped message, websocket and webhook alike
+            health_report.bump("Lark events")
+            health_report.mark("Last Lark event")
         chat_id = event_chat_id or NOTIFY_CHAT_ID
 
         if _parse_secret1_command(text):
@@ -4215,8 +4227,13 @@ def _handle_ws_card_action(data) -> None:
     ).start()
 
 
+# The running lark.ws.Client — kept only so the daily health report can see whether it is
+# connected. Nothing else may touch it.
+_LARK_WS_CLIENT: Any = None
+
+
 def _run_lark_persistent_connection() -> None:
-    global _LARK_RUNTIME_HOST
+    global _LARK_RUNTIME_HOST, _LARK_WS_CLIENT
     try:
         import lark_oapi as lark
     except ImportError:
@@ -4263,6 +4280,7 @@ def _run_lark_persistent_connection() -> None:
         )
         try:
             _LARK_RUNTIME_HOST = domain_url.rstrip("/")
+            _LARK_WS_CLIENT = cli
             cli.start()
             return
         except Exception as exc:
@@ -4292,6 +4310,167 @@ def _run_lark_persistent_connection() -> None:
     raise SystemExit(1) from last_exc
 
 
+# ---- Daily health report -------------------------------------------------------------------
+# One card a day to the ops group via health_report.py (HEALTH_REPORT_* in .env; the defaults
+# live in that module). Started once from _run_main_entry, never at import — tests import this
+# file. Every check is read-only: no chat sends, no POSTs to the duty bot, no builds, no
+# reactions. health_report runs each on its own thread with a 20s budget, so timeouts stay <= 10s.
+
+
+def _health_ms(t0: float) -> int:
+    return int((time.monotonic() - t0) * 1000)
+
+
+def _health_check_lark_api() -> Tuple[str, str]:
+    """A tenant-token fetch proves the Open API domain answers and APP_ID / APP_SECRET work."""
+    host = urlparse(_lark_open_base()).hostname or "?"
+    t0 = time.monotonic()
+    if not _get_tenant_access_token():
+        return "fail", f"tenant token fetch failed on {host} (details in the log)"
+    return "ok", f"tenant token in {_health_ms(t0)} ms ({host})"
+
+
+def _health_check_lark_events() -> Tuple[str, str]:
+    """Event intake. lark-oapi sets its private ``_conn`` to None while the websocket is down."""
+    if not _lark_uses_persistent_connection():
+        return "ok", f"webhook mode (/webhook/event on :{PORT})"
+    cli = _LARK_WS_CLIENT
+    host = urlparse(_LARK_RUNTIME_HOST or "").hostname
+    if cli is None or not host:
+        return "fail", "websocket client is not running"
+    conn = getattr(cli, "_conn", False)  # False: this lark-oapi version does not expose it
+    if conn is None:
+        return "fail", f"websocket to {host} is disconnected (client retrying)"
+    if conn is False:
+        return "ok", f"websocket client running ({host})"
+    return "ok", f"websocket connected ({host})"
+
+
+def _health_check_http_server() -> Tuple[str, str]:
+    """The Flask side: /healthz, plus the /internal/* routes the duty bot calls."""
+    t0 = time.monotonic()
+    try:
+        r = requests.get(f"http://127.0.0.1:{PORT}/healthz", timeout=3)
+    except requests.RequestException as exc:
+        return "fail", f"/healthz on :{PORT} not answering ({type(exc).__name__})"
+    if r.status_code != 200:
+        return "fail", f"/healthz on :{PORT} returned HTTP {r.status_code}"
+    return "ok", f"/healthz HTTP 200 in {_health_ms(t0)} ms (:{PORT})"
+
+
+def _health_check_jenkins_vpn() -> Tuple[str, str]:
+    """VPN_CREATION job API, with the credentials (and order) the VPN flows use. GET only."""
+    job_base = VPN_CREATION_JOB_FOLDER_URL
+    host = urlparse(job_base).hostname or "?"
+    api = f"{job_base.rstrip('/')}/api/json?tree=lastBuild[number]"
+    candidates = [(u, p) for u, p in _auth_candidates_for(job_base) if u and p]
+    if not candidates:
+        return "warn", f"no Jenkins credentials for {host}"
+    status = 0
+    for auth in candidates[:2]:
+        t0 = time.monotonic()
+        try:
+            r = requests.get(api, auth=auth, timeout=8)
+        except requests.RequestException as exc:
+            return "fail", f"{host} unreachable ({type(exc).__name__})"
+        status = r.status_code
+        if status == 200:
+            try:
+                data = r.json()
+            except ValueError:
+                data = None
+            if not isinstance(data, dict):  # the VPN flows reject this too (_jenkins_rest_get)
+                return "warn", f"VPN_CREATION on {host}: HTTP 200 but no Jenkins JSON (login page?)"
+            last = (data.get("lastBuild") or {}).get("number")
+            tail = f", last build #{last}" if last else ""
+            return "ok", f"VPN_CREATION on {host}: HTTP 200 in {_health_ms(t0)} ms{tail}"
+        if status not in (401, 403):
+            break
+    if status >= 500:
+        return "fail", f"VPN_CREATION on {host}: HTTP {status}"
+    why = "credentials rejected" if status in (401, 403) else "job not readable"
+    return "warn", f"VPN_CREATION on {host}: HTTP {status} ({why})"
+
+
+def _health_check_jenkins_watches() -> Tuple[str, str]:
+    """Builds being watched right now, and whether each one still has its poll thread."""
+    with _watch_meta_lock:
+        watches = sorted(_active_watches, key=lambda w: (w[1], w[2]))
+    if not watches:
+        return "ok", "no builds being watched"
+    alive = {t.name for t in threading.enumerate() if t.name.startswith("jenkins-watch-")}
+    orphans = [w for w in watches if f"jenkins-watch-{w[1]}" not in alive]
+    shown = ", ".join(
+        f"{unquote(urlparse(job).path.rstrip('/').rsplit('/', 1)[-1])} #{build} ({mode or 'watch'})"
+        for job, build, mode in watches[:3]  # health_report cuts a detail at 200 chars
+    )
+    if len(watches) > 3:
+        shown += f" +{len(watches) - 3} more"
+    if orphans:
+        return "warn", f"{len(orphans)} of {len(watches)} watches have no poll thread: {shown}"
+    return "ok", f"{len(watches)} active: {shown}"
+
+
+def _health_check_duty_bot() -> Tuple[str, str]:
+    """TCP connect only — the callback endpoints advance queues and send email, so never POST."""
+    import socket
+
+    targets: List[Tuple[str, int]] = []
+    for url in (_duty_updatemore_callback_url(), _duty_reply_update_url()):
+        p = urlparse(url)
+        try:
+            port = p.port or (443 if p.scheme == "https" else 80)
+        except ValueError:
+            continue
+        if port == PORT and p.hostname in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
+            # Our own Flask holds that port, so a TCP connect would "succeed" against ourselves.
+            return "warn", f"duty callback points at this bot's own :{PORT} (set DUTY_BOT_PORT)"
+        if p.hostname and (p.hostname, port) not in targets:
+            targets.append((p.hostname, port))
+    if not targets:
+        return "warn", "duty bot callback URL is not parseable"
+    down = []
+    t0 = time.monotonic()
+    for host, port in targets:
+        try:
+            with socket.create_connection((host, port), timeout=3):
+                pass
+        except OSError as exc:
+            down.append(f"{host}:{port} ({type(exc).__name__})")
+    if down:
+        return "warn", "no TCP connect to " + ", ".join(down) + "; callbacks fall back to Lark"
+    listening = ", ".join(f"{h}:{p}" for h, p in targets)
+    return "ok", f"listening on {listening} ({_health_ms(t0)} ms)"
+
+
+def _health_send_card(chat_id: str, card: Dict[str, Any]) -> Any:
+    # A fresh message (never a thread reply). Not _send_chat_message: its raise_for_status hides
+    # Lark's code (230002 "bot not in the group" comes back as HTTP 400) and it sends no uuid, so
+    # a retry after a delivered-but-timed-out POST would post a second card. The module's sender
+    # raises LarkError(code) and sends the report's uuid; built per call to follow the WS domain.
+    return health_report.make_lark_sender(APP_ID, APP_SECRET, _lark_open_base())(chat_id, card)
+
+
+def _start_health_report() -> None:
+    if health_report is None:
+        logger.warning("health report off: health_report.py is not importable")
+        return
+    health_report.start(
+        "jenkinsbot",
+        send_card=_health_send_card,
+        checks=[
+            ("Lark API", _health_check_lark_api),
+            ("Lark event intake", _health_check_lark_events),
+            ("HTTP server", _health_check_http_server),
+            ("Jenkins VPN_CREATION", _health_check_jenkins_vpn),
+            ("Jenkins watches", _health_check_jenkins_watches),
+            ("Duty bot callback", _health_check_duty_bot),
+        ],
+        # Websocket mode runs Flask on this thread; webhook mode serves on the main thread.
+        expect_threads=["jenkinsbot-flask"] if _lark_uses_persistent_connection() else [],
+    )
+
+
 def _run_main_entry() -> int:
     logger.info(
         "jenkinsbot start python=%s cwd=%s .env=%s exists=%s",
@@ -4306,6 +4485,11 @@ def _run_main_entry() -> int:
         prewarm_vpn_browser_on_startup()
     except Exception as exc:
         logger.warning("VPN browser prewarm skipped: %s", exc)
+    # Before the mode split so websocket and webhook both get it; returns at once (own thread).
+    try:
+        _start_health_report()
+    except Exception as exc:
+        logger.warning("health report not started: %s", exc)
     if _lark_uses_persistent_connection():
         if _port_in_use(PORT):
             logger.error(

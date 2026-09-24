@@ -19,3 +19,8 @@ venv/
 
 # Logs
 *.log
+
+# Daily health report state (health_report.py)
+.health_report_state.json
+.health_report_state.json.tmp
+.health_report_state.lock
